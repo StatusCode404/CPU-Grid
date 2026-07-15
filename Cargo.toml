@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 crossterm = "0.29.0"
+
+[profile.release]
+# Aggressive optimizations
+opt-level = 3          # Maximize speed
+lto = "fat"            # Perform global optimization (highest gain)
+codegen-units = 1      # Compile as one unit (highest optimization potential, slower build)
+panic = "abort"        # Removes stack unwinding code (smaller binary, faster execution)
+strip = true           # Automatically remove debug symbols from the binary (significantly smaller size)
