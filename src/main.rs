@@ -39,17 +39,17 @@ fn print_help() {
     println!("\x1b[1mCPU-Grid ver:{}\x1b[0m", version);
     println!("Copyright (C) 2026 StatusCode404 https://github.com/StatusCode404");
     println!("Project: https://github.com/StatusCode404/CPU-Grid");
-    println!("\nUsage:");
-    println!("  -n <secs>    Interval for CPU stats (default 2.0)");
-    println!("  -r <secs>    Interval for Room Temp (default 2.0)");
-    println!("  -m <secs>    Interval for Memory stats (default 2.0)");
-    println!("\nColor Legend:");
+    println!("\nUsage (Values are in seconds. Parameters given less than or greater than the boundary ranges will fall back to the nearest boundary range.):");
+    println!("  -n[<secs>]    Interval for CPU stats (0.1 - 60s, default 2.0)");
+    println!("  -r[<secs>]    Interval for Room Temp (1 - 3600s, default 2.0)");
+    println!("  -m[<secs>]    Interval for Memory stats (1 - 60s, default 2.0)");
+    println!("\nColor Legend (Color shade gradually changes between the ranges defined underneath):");
     println!("  CPU Freq:      Green(0-50%) -> Yellow(50-70%) -> Orange(70-85%) -> Red(85-100%) -> Violet(>100% overclock)");
     println!("  RAM/Swap Load: Green(0-50%) -> Yellow(50-70%) -> Orange(70-85%) -> Red(85-100%)");
     println!("  CPU Temp:      Green (Cool) -> Red (Thermal Throttle/Critical Limit)");
     println!("                 (Note: Red limit is dynamic, set by your specific CPU hardware)");
     println!("  Room Temp:     Green (<=24) -> Yellow(25) -> Orange(30) -> LtRed(35) -> DkRed(40)");
-    println!("  Zswap Ratio:   Red (1:1) -> Yellow (2.5:1) -> Green (4:1+)");
+    println!("  Zswap Ratio:   Red (1:1) -> Orange (1.5:1) -> Yellow (2.5:1) -> Green (4:1+)");
 }
 
 fn format_size(kb: u64) -> String {
@@ -59,62 +59,46 @@ fn format_size(kb: u64) -> String {
 }
 
 fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
     ((c1.0 as f64 + (c2.0 as f64 - c1.0 as f64) * t).round() as u8,
-     c1.1 + ((c2.1 as f64 - c1.1 as f64) * t).round() as u8,
-     c1.2 + ((c2.2 as f64 - c1.2 as f64) * t).round() as u8)
+     (c1.1 as f64 + (c2.1 as f64 - c1.1 as f64) * t).round() as u8,
+     (c1.2 as f64 + (c2.2 as f64 - c1.2 as f64) * t).round() as u8)
 }
 
 fn get_cpu_color(t: f64) -> String {
-    if t > 1.0 { return "\x1b[38;2;238;130;238m".to_string(); } // Bright Violet
+    if t > 1.0 { return "\x1b[38;2;238;130;238m".to_string(); }
     let t = t.clamp(0.0, 1.0);
-    let (r, g, b) = if t <= 0.5 {
-        lerp_color((0, 200, 0), (255, 255, 0), t / 0.5)
-    } else if t <= 0.7 {
-        lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2)
-    } else if t <= 0.85 {
-        lerp_color((255, 165, 0), (255, 50, 0), (t - 0.7) / 0.15)
-    } else {
-        lerp_color((255, 50, 0), (139, 0, 0), (t - 0.85) / 0.15)
-    };
+    let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
+    else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
+    else if t <= 0.85 { lerp_color((255, 165, 0), (255, 50, 0), (t - 0.7) / 0.15) }
+    else { lerp_color((255, 50, 0), (139, 0, 0), (t - 0.85) / 0.15) };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
 fn get_mem_color(t: f64) -> String {
     let t = t.clamp(0.0, 1.0);
-    let (r, g, b) = if t <= 0.5 {
-        lerp_color((0, 200, 0), (255, 255, 0), t / 0.5)
-    } else if t <= 0.7 {
-        lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2)
-    } else if t <= 0.85 {
-        lerp_color((255, 165, 0), (255, 50, 0), (t - 0.7) / 0.15)
-    } else {
-        lerp_color((255, 50, 0), (139, 0, 0), (t - 0.85) / 0.15)
-    };
+    let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
+    else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
+    else if t <= 0.85 { lerp_color((255, 165, 0), (255, 50, 0), (t - 0.7) / 0.15) }
+    else { lerp_color((255, 50, 0), (139, 0, 0), (t - 0.85) / 0.15) };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
 fn get_room_temp_color(temp: f64) -> String {
-    let (r, g, b) = if temp <= 24.0 {
-        (0, 200, 0)
-    } else if temp <= 25.0 {
-        lerp_color((0, 200, 0), (255, 255, 0), (temp - 24.0) / 1.0)
-    } else if temp <= 30.0 {
-        lerp_color((255, 255, 0), (255, 165, 0), (temp - 25.0) / 5.0)
-    } else if temp <= 35.0 {
-        lerp_color((255, 165, 0), (255, 100, 100), (temp - 30.0) / 5.0)
-    } else {
-        lerp_color((255, 100, 100), (139, 0, 0), ((temp - 35.0) / 5.0).clamp(0.0, 1.0))
-    };
+    let (r, g, b) = if temp <= 24.0 { (0, 200, 0) }
+    else if temp <= 25.0 { lerp_color((0, 200, 0), (255, 255, 0), (temp - 24.0) / 1.0) }
+    else if temp <= 30.0 { lerp_color((255, 255, 0), (255, 165, 0), (temp - 25.0) / 5.0) }
+    else if temp <= 35.0 { lerp_color((255, 165, 0), (255, 100, 100), (temp - 30.0) / 5.0) }
+    else { lerp_color((255, 100, 100), (139, 0, 0), ((temp - 35.0) / 5.0).clamp(0.0, 1.0)) };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
 fn get_ratio_color(ratio: f64) -> String {
-    let t = ((ratio - 1.0) / (4.0 - 1.0)).clamp(0.0, 1.0);
-    let (r, g, b) = if t <= 0.5 {
-        lerp_color((255, 50, 0), (255, 255, 0), t / 0.5)
-    } else {
-        lerp_color((255, 255, 0), (0, 200, 0), (t - 0.5) / 0.5)
-    };
+    let (r, g, b) = if ratio < 1.0 { (255, 50, 0) } // Red
+    else if ratio <= 1.5 { lerp_color((255, 50, 0), (255, 165, 0), (ratio - 1.0) / 0.5) } // Red to Orange
+    else if ratio <= 2.5 { lerp_color((255, 165, 0), (255, 255, 0), (ratio - 1.5) / 1.0) } // Orange to Yellow
+    else if ratio <= 4.0 { lerp_color((255, 255, 0), (0, 200, 0), (ratio - 2.5) / 1.5) } // Yellow to Green
+    else { (0, 200, 0) }; // Green 4:1+
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
@@ -125,15 +109,12 @@ fn get_thermal_stats() -> String {
             let path = entry.path();
             let name = fs::read_to_string(path.join("name")).unwrap_or_default();
             if !name.trim().contains("k10temp") && !name.trim().contains("coretemp") { continue; }
-            
             for file in fs::read_dir(&path).into_iter().flatten().flatten() {
                 let fname = file.file_name().to_string_lossy().into_owned();
                 if !fname.starts_with("temp") || !fname.ends_with("_input") { continue; }
-                
                 let input_val = fs::read_to_string(file.path()).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
                 let read_limit = |file_name| { fs::read_to_string(file.path().with_file_name(file_name)).ok().and_then(|s| s.trim().parse::<f64>().ok()) };
                 let limit = read_limit(fname.replace("_input", "_max")).or_else(|| read_limit(fname.replace("_input", "_crit"))).unwrap_or(95000.0);
-                
                 let color = get_mem_color(input_val / limit);
                 let label = fs::read_to_string(path.join(fname.replace("_input", "_label"))).unwrap_or_else(|_| fname.replace("_input", ""));
                 parts.push(format!("{}: {}{:.1}°C{}", label.trim(), color, input_val / 1000.0, "\x1b[0m"));
@@ -144,18 +125,26 @@ fn get_thermal_stats() -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args().skip(1);
+    let mut args = env::args().skip(1).peekable();
     let mut cpu_interval = DEFAULT_INTERVAL;
     let mut room_interval = DEFAULT_INTERVAL;
     let mut mem_interval = DEFAULT_INTERVAL;
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => { print_help(); return Ok(()); },
-            "-n" => if let Some(v) = args.next() { cpu_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); },
-            "-r" => if let Some(v) = args.next() { room_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); },
-            "-m" => if let Some(v) = args.next() { mem_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); },
-            _ => {}
+        if arg == "-h" || arg == "--help" {
+            print_help(); return Ok(());
+        } else if arg.starts_with("-n") {
+            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) }
+                      else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
+            cpu_interval = val.clamp(0.1, 60.0);
+        } else if arg.starts_with("-r") {
+            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) }
+                      else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
+            room_interval = val.clamp(1.0, 3600.0);
+        } else if arg.starts_with("-m") {
+            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) }
+                      else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
+            mem_interval = val.clamp(1.0, 60.0);
         }
     }
 
@@ -246,12 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let ratio_color = if ratio > 0.0 { get_ratio_color(ratio) } else { "\x1b[0m".to_string() }; 
                     zswap_str = format!("Zswap: Enabled | Pool: {}{}{} | Ratio: {}{:.1}:1\x1b[0m", pool_color, format_size(pool / 1024), "\x1b[0m", ratio_color, ratio); 
                 },
-                (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    zswap_str = "Zswap: Enabled (Unavailable, sudo required)".to_string();
-                },
-                _ => {
-                    zswap_str = "Zswap: Enabled (Error reading stats)".to_string();
-                }
+                _ => zswap_str = "Zswap: Enabled (Error reading stats)".to_string(),
             }
         } 
         let full_mem_str = format!("{}\n{}\nSwap: Total {}\nSwap Devices: {}", ram_str, zswap_str, format_size(total_swap), swap_lines.join(" | ")); 
@@ -312,7 +296,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
-        // Header section
         let version = env!("CARGO_PKG_VERSION");
         print_line(&mut row, format!("\x1b[1mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
         print_line(&mut row, format!("\x1b[1m{}\x1b[0m", state.cpu_model), &mut stdout)?;

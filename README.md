@@ -13,6 +13,7 @@ CPU-Grid is a real-time, terminal-based system monitoring tool written in Rust. 
 - **Low Latency**: Built with a multi-threaded architecture for responsive updates.
 
 ## Color Legend
+Color shade gradually changes between the ranges defined underneath.
 
 | Metric | Color Scale |
 | :--- | :--- |
@@ -20,7 +21,7 @@ CPU-Grid is a real-time, terminal-based system monitoring tool written in Rust. 
 | **RAM/Swap** | Green (0-50%) → Yellow (50-70%) → Orange (70-85%) → Red (85-100%) |
 | **CPU Temp** | Green (Cool) → Red (Thermal Throttle/Critical Limit) |
 | **Room Temp**| Green (≤24°C) → Yellow (25°C) → Orange (30°C) → LtRed (35°C) → DkRed (40°C) |
-| **Zswap** | Red (1:1) → Yellow (2.5:1) → Green (4:1+) |
+| **Zswap** | Red (1:1) -> Orange (1.5:1) -> Yellow (2.5:1) -> Green (4:1+) |
 
 ## Requirements
 
@@ -44,16 +45,17 @@ CPU-Grid is a real-time, terminal-based system monitoring tool written in Rust. 
 
 3. Run the application:
    ```bash
-   ./target/release/cpu-grid
+   ./target/release/cpu_grid
    ```
 
 ## Usage
+Values are in seconds. Parameters given less than or greater than the boundary ranges will fall back to the nearest boundary range.
 
 | Flag | Description | Default |
 | :--- | :--- | :--- |
-| `-n <secs>` | Interval for CPU stats | 2.0s |
-| `-r <secs>` | Interval for Room Temp | 2.0s |
-| `-m <secs>` | Interval for Memory stats | 2.0s |
+| `-n <secs>` | Interval for CPU stats | 0.1 - 60s, default 2.0 |
+| `-r <secs>` | Interval for Room Temp | 1 - 3600s, default 2.0 |
+| `-m <secs>` | Interval for Memory stats | 1 - 60s, default 2.0 |
 
 **Controls:**
 - Press `Q` or `Ctrl+C` to quit the application.
