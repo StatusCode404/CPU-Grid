@@ -32,11 +32,9 @@ git clone https://github.com/StatusCode404/CPU-Grid.git
 cd cpu-grid
 
 
-
 Build the project:
 
 cargo build --release
-
 
 
 Run the application:
@@ -44,15 +42,33 @@ Run the application:
 ./target/release/cpu-grid
 
 
-
 Usage
 
 The application accepts the following command-line arguments to customize refresh intervals:
 
-| Flag | Description | Default |
-| -n <secs> | Interval for CPU stats | 2.0s |
-| -r <secs> | Interval for Room Temp | 2.0s |
-| -m <secs> | Interval for Memory stats | 2.0s |
+Flag
+
+Description
+
+Default
+
+-n <secs>
+
+Interval for CPU stats
+
+2.0s
+
+-r <secs>
+
+Interval for Room Temp
+
+2.0s
+
+-m <secs>
+
+Interval for Memory stats
+
+2.0s
 
 Controls:
 
