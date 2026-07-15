@@ -14,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 const DEFAULT_INTERVAL: f64 = 2.0;
-const MIN_CELL_WIDTH: usize = 23; 
+const MIN_CELL_WIDTH: usize = 23;
 
 enum Msg {
     CpuFreqs(Vec<f64>),
@@ -32,16 +32,24 @@ struct SystemState {
     mem_stats: String,
 }
 
+// --- Display & Formatting Helpers ---
+
 fn print_help() {
-    println!("CPU Grid v0.6.0 Usage:");
+    let version = env!("CARGO_PKG_VERSION");
+    println!("\x1b[1mCPU-Grid ver:{}\x1b[0m", version);
+    println!("Copyright (C) 2026 StatusCode404 https://github.com/StatusCode404");
+    println!("Project: https://github.com/StatusCode404/CPU-Grid");
+    println!("\nUsage:");
     println!("  -n <secs>    Interval for CPU stats (default 2.0)");
     println!("  -r <secs>    Interval for Room Temp (default 2.0)");
     println!("  -m <secs>    Interval for Memory stats (default 2.0)");
     println!("\nColor Legend:");
-    println!("  CPU/RAM/Swap Load (0-100%): Green(0%) -> Yellow(50%) -> Red(80%) -> Dark Red(100%)");
-    println!("  CPU Temperature:            Green (Cool) -> Red (Throttle Limit)");
-    println!("  Room Temperature:           Green (<=24) -> Yellow(25) -> Orange(30) -> LtRed(35) -> DkRed(40)");
-    println!("  Zswap Ratio:                Red (1:1) -> Yellow (2.5:1) -> Green (4:1+)");
+    println!("  CPU Freq:      Green(0-50%) -> Yellow(50-70%) -> Orange(70-85%) -> Red(85-100%) -> Violet(>100% overclock)");
+    println!("  RAM/Swap Load: Green(0-50%) -> Yellow(50-70%) -> Orange(70-85%) -> Red(85-100%)");
+    println!("  CPU Temp:      Green (Cool) -> Red (Thermal Throttle/Critical Limit)");
+    println!("                 (Note: Red limit is dynamic, set by your specific CPU hardware)");
+    println!("  Room Temp:     Green (<=24) -> Yellow(25) -> Orange(30) -> LtRed(35) -> DkRed(40)");
+    println!("  Zswap Ratio:   Red (1:1) -> Yellow (2.5:1) -> Green (4:1+)");
 }
 
 fn format_size(kb: u64) -> String {
@@ -56,14 +64,31 @@ fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
      c1.2 + ((c2.2 as f64 - c1.2 as f64) * t).round() as u8)
 }
 
-fn get_dynamic_color(t: f64) -> String {
+fn get_cpu_color(t: f64) -> String {
+    if t > 1.0 { return "\x1b[38;2;238;130;238m".to_string(); } // Bright Violet
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 {
         lerp_color((0, 200, 0), (255, 255, 0), t / 0.5)
-    } else if t <= 0.8 {
-        lerp_color((255, 255, 0), (255, 50, 0), (t - 0.5) / 0.3)
+    } else if t <= 0.7 {
+        lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2)
+    } else if t <= 0.85 {
+        lerp_color((255, 165, 0), (255, 50, 0), (t - 0.7) / 0.15)
     } else {
-        lerp_color((255, 50, 0), (139, 0, 0), (t - 0.8) / 0.2)
+        lerp_color((255, 50, 0), (139, 0, 0), (t - 0.85) / 0.15)
+    };
+    format!("\x1b[38;2;{};{};{}m", r, g, b)
+}
+
+fn get_mem_color(t: f64) -> String {
+    let t = t.clamp(0.0, 1.0);
+    let (r, g, b) = if t <= 0.5 {
+        lerp_color((0, 200, 0), (255, 255, 0), t / 0.5)
+    } else if t <= 0.7 {
+        lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2)
+    } else if t <= 0.85 {
+        lerp_color((255, 165, 0), (255, 50, 0), (t - 0.7) / 0.15)
+    } else {
+        lerp_color((255, 50, 0), (139, 0, 0), (t - 0.85) / 0.15)
     };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
@@ -93,23 +118,44 @@ fn get_ratio_color(ratio: f64) -> String {
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.contains(&"-h".to_string()) || args.contains(&"--help".to_string()) {
-        print_help();
-        return Ok(());
+fn get_thermal_stats() -> String {
+    let mut parts = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = fs::read_to_string(path.join("name")).unwrap_or_default();
+            if !name.trim().contains("k10temp") && !name.trim().contains("coretemp") { continue; }
+            
+            for file in fs::read_dir(&path).into_iter().flatten().flatten() {
+                let fname = file.file_name().to_string_lossy().into_owned();
+                if !fname.starts_with("temp") || !fname.ends_with("_input") { continue; }
+                
+                let input_val = fs::read_to_string(file.path()).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
+                let read_limit = |file_name| { fs::read_to_string(file.path().with_file_name(file_name)).ok().and_then(|s| s.trim().parse::<f64>().ok()) };
+                let limit = read_limit(fname.replace("_input", "_max")).or_else(|| read_limit(fname.replace("_input", "_crit"))).unwrap_or(95000.0);
+                
+                let color = get_mem_color(input_val / limit);
+                let label = fs::read_to_string(path.join(fname.replace("_input", "_label"))).unwrap_or_else(|_| fname.replace("_input", ""));
+                parts.push(format!("{}: {}{:.1}°C{}", label.trim(), color, input_val / 1000.0, "\x1b[0m"));
+            }
+        }
     }
+    if parts.is_empty() { "N/A".into() } else { parts.join(" | ") }
+}
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1);
     let mut cpu_interval = DEFAULT_INTERVAL;
     let mut room_interval = DEFAULT_INTERVAL;
     let mut mem_interval = DEFAULT_INTERVAL;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-n" => { if let Some(v) = args.get(i+1) { cpu_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); i += 2; } },
-            "-r" => { if let Some(v) = args.get(i+1) { room_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); i += 2; } },
-            "-m" => { if let Some(v) = args.get(i+1) { mem_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); i += 2; } },
-            _ => { i += 1; }
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => { print_help(); return Ok(()); },
+            "-n" => if let Some(v) = args.next() { cpu_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); },
+            "-r" => if let Some(v) = args.next() { room_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); },
+            "-m" => if let Some(v) = args.next() { mem_interval = v.parse().unwrap_or(DEFAULT_INTERVAL); },
+            _ => {}
         }
     }
 
@@ -125,61 +171,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::channel::<Msg>();
     
     // CPU Thread
-    let tx_cpu = tx.clone(); thread::spawn(move || { loop { let info = fs::read_to_string("/proc/cpuinfo").unwrap_or_default(); let freqs = info.lines().filter(|l| l.starts_with("cpu MHz")).filter_map(|l| l.split(':').nth(1)?.trim().parse::<f64>().ok()).collect(); let _ = tx_cpu.send(Msg::CpuFreqs(freqs)); thread::sleep(Duration::from_secs_f64(cpu_interval)); }});
+    let tx_cpu = tx.clone(); 
+    thread::spawn(move || loop { 
+        let info = fs::read_to_string("/proc/cpuinfo").unwrap_or_default(); 
+        let freqs = info.lines().filter(|l| l.starts_with("cpu MHz")).filter_map(|l| l.split(':').nth(1)?.trim().parse::<f64>().ok()).collect(); 
+        let _ = tx_cpu.send(Msg::CpuFreqs(freqs)); 
+        thread::sleep(Duration::from_secs_f64(cpu_interval)); 
+    });
     
     // Thermal Thread
-    let tx_ctemp = tx.clone(); thread::spawn(move || { 
-        loop { 
-            let mut parts = Vec::new(); 
-            if let Ok(entries) = fs::read_dir("/sys/class/hwmon") { 
-                for entry in entries.flatten() { 
-                    let path = entry.path(); 
-                    if let Ok(name) = fs::read_to_string(path.join("name")) { 
-                        if name.trim().contains("k10temp") || name.trim().contains("coretemp") { 
-                            for file in fs::read_dir(&path).into_iter().flatten().flatten() { 
-                                let fname = file.file_name().to_string_lossy().into_owned(); 
-                                if fname.starts_with("temp") && fname.ends_with("_input") { 
-                                    let input_val = fs::read_to_string(file.path()).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
-                                    let read_limit = |file_name| { fs::read_to_string(file.path().with_file_name(file_name)).ok().and_then(|s| s.trim().parse::<f64>().ok()) };
-                                    let limit = read_limit(fname.replace("_input", "_max")).or_else(|| read_limit(fname.replace("_input", "_crit"))).unwrap_or(95000.0); 
-                                    let color = get_dynamic_color(input_val / limit);
-                                    let label = fs::read_to_string(path.join(fname.replace("_input", "_label"))).unwrap_or_else(|_| fname.replace("_input", ""));
-                                    parts.push(format!("{}: {}{:.1}°C{}", label.trim(), color, input_val / 1000.0, "\x1b[0m"));
-                                } 
-                            } 
-                        } 
-                    } 
-                } 
-            } 
-            let _ = tx_ctemp.send(Msg::CpuTemps(if parts.is_empty() { "N/A".into() } else { parts.join(" | ") })); 
-            thread::sleep(Duration::from_secs_f64(cpu_interval)); 
-        }
+    let tx_ctemp = tx.clone(); 
+    thread::spawn(move || loop { 
+        let _ = tx_ctemp.send(Msg::CpuTemps(get_thermal_stats())); 
+        thread::sleep(Duration::from_secs_f64(cpu_interval)); 
     });
 
     // Room Temp Thread
-    let tx_room = tx.clone(); thread::spawn(move || { 
-        loop { 
-            let out = Command::new("temper-poll").output();
-            let msg = if let Ok(o) = out {
-                let s = String::from_utf8_lossy(&o.stdout);
-                if let Some(line) = s.lines().find(|l| l.contains("Device #0:")) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if let Some(temp_str) = parts.iter().find(|p| p.contains('°')) {
-                        let clean_temp = temp_str.replace('°', "").replace('C', "");
-                        if let Ok(temp) = clean_temp.parse::<f64>() {
-                            format!("{}{:.1}°C{}", get_room_temp_color(temp), temp, "\x1b[0m")
-                        } else { "No thermometer detected".to_string() }
+    let tx_room = tx.clone(); 
+    thread::spawn(move || loop { 
+        let out = Command::new("temper-poll").output();
+        let msg = if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if let Some(line) = s.lines().find(|l| l.contains("Device #0:")) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(temp_str) = parts.iter().find(|p| p.contains('°')) {
+                    let clean_temp = temp_str.replace('°', "").replace('C', "");
+                    if let Ok(temp) = clean_temp.parse::<f64>() {
+                        format!("{}{:.1}°C{}", get_room_temp_color(temp), temp, "\x1b[0m")
                     } else { "No thermometer detected".to_string() }
                 } else { "No thermometer detected".to_string() }
-            } else { "No thermometer detected".to_string() };
-            let _ = tx_room.send(Msg::RoomTemp(msg)); 
-            thread::sleep(Duration::from_secs_f64(room_interval)); 
-        }
+            } else { "No thermometer detected".to_string() }
+        } else { "No thermometer detected".to_string() };
+        let _ = tx_room.send(Msg::RoomTemp(msg)); 
+        thread::sleep(Duration::from_secs_f64(room_interval)); 
     });
 
     // Mem Thread
-    let tx_mem = tx.clone(); thread::spawn(move || { loop { let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default(); let (mut total, mut avail) = (0u64, 0u64); for line in meminfo.lines() { let p: Vec<&str> = line.split_whitespace().collect(); if p.len() < 2 { continue; } let val = p[1].parse::<u64>().unwrap_or(0); if p[0] == "MemTotal:" { total = val; } else if p[0] == "MemAvailable:" { avail = val; } } let used = total.saturating_sub(avail); let ram_percent = if total > 0 { used as f64 / total as f64 } else { 0.0 }; let ram_str = format!("RAM: {}{}{} Used / {} Total | Avail: {}", get_dynamic_color(ram_percent), format_size(used), "\x1b[0m", format_size(total), format_size(avail)); let swaps = fs::read_to_string("/proc/swaps").unwrap_or_default(); let mut total_swap = 0u64; let mut swap_lines = Vec::new(); for line in swaps.lines().skip(1) { let p: Vec<&str> = line.split_whitespace().collect(); if p.len() >= 4 { let size = p[2].parse::<u64>().unwrap_or(0); let used = p[3].parse::<u64>().unwrap_or(0); total_swap += size; let swap_percent = if size > 0 { used as f64 / size as f64 } else { 0.0 }; swap_lines.push(format!("{}{} ({} used / {} total){}", p[0].split('/').last().unwrap_or("swap"), get_dynamic_color(swap_percent), format_size(used), format_size(size), "\x1b[0m")); } } let mut zswap_str = "Zswap: Disabled".to_string(); if fs::read_to_string("/sys/module/zswap/parameters/enabled").unwrap_or_default().trim() == "Y" { let algo = fs::read_to_string("/sys/module/zswap/parameters/compressor").unwrap_or_else(|_| "unknown".to_string()); if let (Ok(p_str), Ok(pg_str)) = (fs::read_to_string("/sys/kernel/debug/zswap/pool_total_size"), fs::read_to_string("/sys/kernel/debug/zswap/stored_pages")) { let pool = p_str.trim().parse::<u64>().unwrap_or(0); let pages = pg_str.trim().parse::<u64>().unwrap_or(0); let ratio = if pool > 0 { (pages * 4 * 1024) as f64 / (pool as f64) } else { 0.0 }; let pool_color = if pool > 0 { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;150;150;150m" }; let ratio_color = if ratio > 0.0 { get_ratio_color(ratio) } else { "\x1b[0m".to_string() }; zswap_str = format!("Zswap: Enabled ({}) | Pool: {}{}{} | Ratio: {}{:.1}:1\x1b[0m", algo.trim(), pool_color, format_size(pool / 1024), "\x1b[0m", ratio_color, ratio); } } let full_mem_str = format!("{}\n{}\nSwap: Total {}\nSwap Devices: {}", ram_str, zswap_str, format_size(total_swap), swap_lines.join(" | ")); let _ = tx_mem.send(Msg::MemStats(full_mem_str)); thread::sleep(Duration::from_secs_f64(mem_interval)); }});
+    let tx_mem = tx.clone(); 
+    thread::spawn(move || loop { 
+        let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default(); 
+        let (mut total, mut avail) = (0u64, 0u64); 
+        for line in meminfo.lines() { 
+            let p: Vec<&str> = line.split_whitespace().collect(); 
+            if p.len() < 2 { continue; } 
+            let val = p[1].parse::<u64>().unwrap_or(0); 
+            if p[0] == "MemTotal:" { total = val; } else if p[0] == "MemAvailable:" { avail = val; } 
+        } 
+        let used = total.saturating_sub(avail); 
+        let ram_percent = if total > 0 { used as f64 / total as f64 } else { 0.0 }; 
+        let ram_str = format!("RAM: {}{}{} Used / {} Total | Avail: {}", get_mem_color(ram_percent), format_size(used), "\x1b[0m", format_size(total), format_size(avail)); 
+        
+        let swaps = fs::read_to_string("/proc/swaps").unwrap_or_default(); 
+        let mut total_swap = 0u64; 
+        let mut swap_lines = Vec::new(); 
+        for line in swaps.lines().skip(1) { 
+            let p: Vec<&str> = line.split_whitespace().collect(); 
+            if p.len() >= 4 { 
+                let size = p[2].parse::<u64>().unwrap_or(0); 
+                let used = p[3].parse::<u64>().unwrap_or(0); 
+                total_swap += size; 
+                let swap_percent = if size > 0 { used as f64 / size as f64 } else { 0.0 }; 
+                swap_lines.push(format!("{}{} ({} used / {} total){}", p[0].split('/').last().unwrap_or("swap"), get_mem_color(swap_percent), format_size(used), format_size(size), "\x1b[0m")); 
+            } 
+        } 
+        
+        let mut zswap_str = "Zswap: Disabled".to_string(); 
+        if fs::read_to_string("/sys/module/zswap/parameters/enabled").unwrap_or_default().trim() == "Y" { 
+            match (fs::read_to_string("/sys/kernel/debug/zswap/pool_total_size"), fs::read_to_string("/sys/kernel/debug/zswap/stored_pages")) {
+                (Ok(p_str), Ok(pg_str)) => {
+                    let pool = p_str.trim().parse::<u64>().unwrap_or(0); 
+                    let pages = pg_str.trim().parse::<u64>().unwrap_or(0); 
+                    let ratio = if pool > 0 { (pages * 4 * 1024) as f64 / (pool as f64) } else { 0.0 }; 
+                    let pool_color = if pool > 0 { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;150;150;150m" }; 
+                    let ratio_color = if ratio > 0.0 { get_ratio_color(ratio) } else { "\x1b[0m".to_string() }; 
+                    zswap_str = format!("Zswap: Enabled | Pool: {}{}{} | Ratio: {}{:.1}:1\x1b[0m", pool_color, format_size(pool / 1024), "\x1b[0m", ratio_color, ratio); 
+                },
+                (Err(e), _) | (_, Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    zswap_str = "Zswap: Enabled (Unavailable, sudo required)".to_string();
+                },
+                _ => {
+                    zswap_str = "Zswap: Enabled (Error reading stats)".to_string();
+                }
+            }
+        } 
+        let full_mem_str = format!("{}\n{}\nSwap: Total {}\nSwap Devices: {}", ram_str, zswap_str, format_size(total_swap), swap_lines.join(" | ")); 
+        let _ = tx_mem.send(Msg::MemStats(full_mem_str)); 
+        thread::sleep(Duration::from_secs_f64(mem_interval)); 
+    });
 
+    // --- Terminal Setup ---
     terminal::enable_raw_mode()?;
     let mut stdout = BufWriter::new(io::stdout());
     execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?; 
@@ -206,10 +286,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let (max_w, max_h) = terminal::size()?;
-        let cols = ((max_w as usize / MIN_CELL_WIDTH).max(1)).min(state.freqs.len());
+        let cols = (max_w as usize / MIN_CELL_WIDTH).max(1).min(state.freqs.len().max(1));
         let cpu_rows = (state.freqs.len() + cols - 1) / cols;
         let mem_rows = state.mem_stats.lines().count() as u16;
-        let required_height = 5 + cpu_rows as u16 + 1 + mem_rows; 
+        let required_height = 6 + cpu_rows as u16 + 1 + mem_rows; 
 
         if max_w < MIN_CELL_WIDTH as u16 || max_h < required_height {
             stdout.queue(terminal::Clear(ClearType::All))?;
@@ -232,13 +312,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
+        // Header section
+        let version = env!("CARGO_PKG_VERSION");
+        print_line(&mut row, format!("\x1b[1mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
         print_line(&mut row, format!("\x1b[1m{}\x1b[0m", state.cpu_model), &mut stdout)?;
-        
+
         match state.limits {
             (Some(min), Some(max)) => print_line(&mut row, format!("Hardware Limits: {:.0} MHz Min | {:.0} MHz Max", min, max), &mut stdout)?,
             _ => print_line(&mut row, "Hardware Limits: Unavailable".to_string(), &mut stdout)?,
         }
-        
         print_line(&mut row, format!("Room Temp: {} | CPU Temps: {}", state.room_temp, state.cpu_temps), &mut stdout)?;
         print_line(&mut row, "Type 'Q' or Ctrl+C to quit.".to_string(), &mut stdout)?;
         
@@ -253,21 +335,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if row >= max_h - 1 { break; }
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
-            
             for c in 0..cols {
                 let idx = r * cols + c;
                 if idx < state.freqs.len() {
                     let freq = state.freqs[idx];
                     let color = if let (Some(min), Some(max)) = state.limits {
-                        get_dynamic_color(((freq - min) / (max - min)).clamp(0.0, 1.0))
+                        get_cpu_color((freq - min) / (max - min))
                     } else { String::new() };
-                    
-                    let (display_freq, unit) = if freq >= 1000.0 {
-                        (freq / 1000.0, "GHz")
-                    } else {
-                        (freq, "MHz")
-                    };
-                    
+                    let (display_freq, unit) = if freq >= 1000.0 { (freq / 1000.0, "GHz") } else { (freq, "MHz") };
                     let sep = if c < cols - 1 { " | " } else { "" };
                     write!(stdout, "Core {:02}: {}{:8.3} {}\x1b[0m{}", idx, color, display_freq, unit, sep)?;
                 }

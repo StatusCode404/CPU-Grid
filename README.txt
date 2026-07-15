@@ -7,6 +7,7 @@ It provides a clean, color-coded overview of your system's performance,
 including CPU frequencies, hardware temperatures, memory utilization, and 
 Zswap metrics.
 
+
 --------------------------------------------------------------------------------
 FEATURES
 --------------------------------------------------------------------------------
@@ -26,6 +27,18 @@ REQUIREMENTS
 * Dependencies: Crossterm (Used for terminal manipulation).
 * External Command: Requires temper-poll to be installed and in your system 
   PATH to display room temperature.
+
+--------------------------------------------------------------------------------
+COLOR LEGEND
+--------------------------------------------------------------------------------
+CPU-Grid uses a color-coded interface to give you instant system health insights:
+
+>>> CPU Freq:     Green(0-50%) -> Yellow(50-70%) -> Orange(70-85%) -> Red(85-100%)
+                  -> Bright Violet(>100% / Overclocked)
+>>> RAM/Swap:     Green(0-50%) -> Yellow(50-70%) -> Orange(70-85%) -> Red(85-100%)
+>>> CPU Temp:     Dynamic transition to Red based on your hardware's T-Crit.
+>>> Room Temp:    Green (<=24°C) -> Yellow(25°C) -> Orange(30°C) -> LtRed(35°C) -> DkRed(40°C)
+>>> Zswap Ratio:  Red (1:1) -> Yellow (2.5:1) -> Green (4:1+)
 
 --------------------------------------------------------------------------------
 INSTALLATION
