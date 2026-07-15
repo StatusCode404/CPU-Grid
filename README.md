@@ -1,5 +1,7 @@
 # CPU-Grid
 
+![CPU-Grid in action](Screenshot-Main.png)
+
 CPU-Grid is a real-time, terminal-based system monitoring tool written in Rust. It provides a clean, color-coded overview of your system's performance, including CPU frequencies, hardware temperatures, memory utilization, and Zswap metrics.
 
 ## Features
