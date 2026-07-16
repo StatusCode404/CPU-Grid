@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "cpu_grid"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "crossterm",
  "which",
