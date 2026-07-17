@@ -11,6 +11,8 @@ CPU-Grid is a real-time, terminal-based system monitoring tool written in Rust. 
 - **Zswap Insight**: Monitors Zswap compression and pool statistics (if enabled).
 - **Room Temperature**: Integrates with `temper-poll` to display ambient room temperature.
 - **Low Latency**: Built with a multi-threaded architecture for responsive updates.
+- **Zero/Negligible Resource Footprint**: CPU-Grid shows '0' Core % usage. It has no effect on your use of the system. Memeory use is ~500KB.
+- **Squashable Grid**: It's primary design goal was to be able to show logical core frequencies, temperatures, and memory & swap pressure all in a grid in the smallest shrunk terminal window possible with the least amount of resources used.  The grid will reorient based on terminal window dimensions.
 
 ## Color Legend
 Color shade gradually changes between the ranges defined underneath.
@@ -21,7 +23,8 @@ Color shade gradually changes between the ranges defined underneath.
 | **RAM/Swap** | Green (0-50%) → Yellow (50-70%) → Orange (70-85%) → Red (85-100%) |
 | **CPU Temp** | Green (Cool) → Red (Thermal Throttle/Critical Limit) |
 | **Room Temp**| Green (≤24°C) → Yellow (25°C) → Orange (30°C) → LtRed (35°C) → DkRed (40°C) |
-| **Zswap** | Red (1:1) -> Orange (1.5:1) -> Yellow (2.5:1) -> Green (4:1+) |
+| **Zswap Satus** | Green (Enabled) -> Bright Red (Disabled) -> Yellow (Unknown Status) -> Dark Red (Not Present) |
+| **Zswap Ratio** | Red (1:1) -> Orange (1.5:1) -> Yellow (2.5:1) -> Green (4:1+) |
 
 ## Requirements
 
@@ -50,6 +53,9 @@ Color shade gradually changes between the ranges defined underneath.
 
 ## Usage
 Values are in seconds. Parameters given less than or greater than the boundary ranges will fall back to the nearest boundary range.
+
+**Tips:**
+  If running with sudo and Room Temp fails, use 'sudo -E' to preserve your user environment if temper-poll is only usable by the user and not sudo.
 
 | Flag | Description | Default |
 | :--- | :--- | :--- |
