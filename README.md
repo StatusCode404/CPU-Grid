@@ -15,6 +15,7 @@ CPU-Grid is a real-time, terminal-based system monitoring tool written in Rust. 
 - **Zswap Insight**: Monitors Zswap compression algorithms, pool statistics, and compression ratios to flag performance degradation (if enabled).
 - **Room Temperature**: Integrates with temper-poll to display ambient room temperature, including dynamic text warnings if the room reaches critical heat levels.
 - **Ultra-Lightweight & Safe**: Built with a multi-threaded architecture featuring zero-allocation data polling loops and strict thread cleanup for minimal CPU footprint and zero memory leaks.  For reference: a Ryzen 5950x running CPU-Grid with 1 milisecond interval update for cpu frequencies ('-n 0.1' which is the minimum allowed) and cpu temperature readings, which is the hardest load you can apply to this program; registers 0% to 0.67% of one logical core usage using ~400KB-500KB of memory executing 24/7!
+- **Squashable Grid**: It's primary design goal was to be able to show logical core frequencies, temperatures, memory & swap pressure all in a grid in the smallest shrunk terminal window possible with the least amount of resources used.  The grid will reorient based on terminal window dimensions.
 
 ## Color Legend
 Color shade gradually changes between the ranges defined underneath.
