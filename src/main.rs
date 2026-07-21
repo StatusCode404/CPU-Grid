@@ -1,3 +1,4 @@
+
 #![cfg(target_os = "linux")]
 
 use crossterm::{
@@ -17,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_INTERVAL: f64 = 2.0;
-const MIN_CELL_WIDTH: usize = 16; 
+const MIN_CELL_WIDTH: usize = 16; // Reduced to allow tighter horizontal grid squeezing
 
 // --- Data Structures ---
 
@@ -30,7 +31,7 @@ struct SwapStat {
 
 enum Msg {
     CpuFreqs(Vec<f64>),
-    CpuTemps(Vec<(String, Vec<String>)>),
+    CpuTemps(Vec<(String, Vec<String>)>), // (Parent CPU/Adapter, Vec of formatted Chiplet strings)
     RoomTemp(String),
     MemStats {
         ram_str: String,
@@ -38,8 +39,8 @@ enum Msg {
         swap_total_str: String,
         swaps: Vec<SwapStat>,
     },
-    NetStats(Vec<(String, f64, f64, f64)>), 
-    NetEvent(String, String),               
+    NetStats(Vec<(String, f64, f64, f64)>), // Interface, Rx Speed, Tx Speed, Max Speed
+    NetEvent(String, String),               // Interface Name, Event String (ACTIVATED/DEACTIVATED)
     UserIdle(Duration),
 }
 
@@ -162,7 +163,7 @@ fn format_idle_time(secs: u64) -> String {
     }
 }
 
-// [SIMD Optimization]: #[inline(always)] forces this heavily utilized math function 
+// [SIMD Optimization]: #[inline(always)] forces this heavily utilized math function
 // to be directly injected into mapping closures. When iterating over arrays (like CPU cores),
 // LLVM can auto-vectorize the lerp calculations across multiple elements simultaneously via SIMD hardware.
 #[inline(always)]
@@ -179,7 +180,7 @@ fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
 fn format_dynamic_6(val: f64) -> String {
     let int_part = val.trunc();
     let int_len = if int_part == 0.0 { 1 } else { int_part.abs().log10().floor() as i32 + 1 };
-    
+   
     if int_len >= 6 {
         format!("{:6.0}", val.clamp(0.0, 999999.0))
     } else {
@@ -190,26 +191,26 @@ fn format_dynamic_6(val: f64) -> String {
 
 #[inline]
 fn get_cpu_color(t: f64) -> String {
-    if t >= 1.0 { return "\x1b[1;38;2;238;130;238m".to_string(); } 
+    if t >= 1.0 { return "\x1b[1;38;2;238;130;238m".to_string(); }
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
-    else if t <= 0.85 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.15) } 
+    else if t <= 0.85 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.15) }
     else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.85) / 0.15) };              
-    
-    if t >= 0.85 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) } 
+   
+    if t >= 0.85 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
     else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
 
 #[inline]
 fn get_ram_color(t: f64) -> String {
-    if t >= 0.95 { return "\x1b[1;38;2;238;130;238m".to_string(); } 
+    if t >= 0.95 { return "\x1b[1;38;2;238;130;238m".to_string(); }
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
     else if t <= 0.85 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.15) }
     else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.85) / 0.10) };
-    
+   
     if t >= 0.85 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
     else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
@@ -222,7 +223,7 @@ fn get_swap_color(t: f64) -> String {
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
     else if t <= 0.8 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.1) }
     else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.8) / 0.1) };
-    
+   
     if t >= 0.8 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
     else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
@@ -236,14 +237,14 @@ fn get_net_color(speed: f64, max_speed: f64) -> String {
     else if t <= 0.66 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.33) / 0.33) }
     else if t <= 0.83 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.66) / 0.17) }
     else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.83) / 0.17) };
-    
+   
     if t >= 0.83 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
     else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
 
 #[inline]
 fn get_idle_color(secs: u64) -> String {
-    let t = secs as f64 / 31536000.0; 
+    let t = secs as f64 / 31536000.0;
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.25 {
         lerp_color((0, 200, 0), (255, 255, 0), t / 0.25)
@@ -330,8 +331,8 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
                 continue;
             }
 
-            let parent_name = name.trim().to_string(); 
-            let mut chiplet_parts = Vec::new(); 
+            let parent_name = name.trim().to_string();
+            let mut chiplet_parts = Vec::new();
 
             for file in fs::read_dir(&path).into_iter().flatten().flatten() {
                 let fname = file.file_name().to_string_lossy().into_owned();
@@ -351,7 +352,7 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
 
                 let limit = read_limit(fname.replace("_input", "_max"))
                     .or_else(|| read_limit(fname.replace("_input", "_crit")))
-                    .unwrap_or(95000.0); 
+                    .unwrap_or(95000.0);
 
                 let color = get_cpu_color(input_val / limit);
                 let label = fs::read_to_string(path.join(fname.replace("_input", "_label")))
@@ -548,11 +549,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. CPU Thread - Buffer is instantiated ONCE outside the loop to prevent memory bloat over uptime.
     let tx_cpu = tx.clone();
     thread::Builder::new().name("cg-cpu".to_string()).spawn(move || {
-        let mut buf = String::with_capacity(8192); 
+        let mut buf = String::with_capacity(8192);
         loop {
             buf.clear(); // RAII: Reuse the buffer allocation, keeping stack/heap perfectly clean
             if let Ok(mut file) = File::open("/proc/cpuinfo") { let _ = file.read_to_string(&mut buf); }
-            
+           
             let freqs = buf
                 .lines()
                 .filter(|l| l.starts_with("cpu MHz") || l.starts_with("BogoMIPS"))
@@ -682,12 +683,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let algo_trim = algo.trim();
                                     let algo_color = get_zswap_algo_color(algo_trim);
 
+                                    // All Zswap metric values explicitly formatted with \x1b[1m (Bold)
                                     format!(
-                                        "\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m | \x1b[1mAlgo:\x1b[0m {}{}\x1b[0m | \x1b[1mPool:\x1b[0m {}{}\x1b[0m | \x1b[1mRatio:\x1b[0m {}{:.1}:1\x1b[0m",
-                                        algo_color, algo_trim, pool_color, format_size(pool / 1024), ratio_color, ratio
+                                        "\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m | \x1b[1mAlgo:\x1b[0m {algo_color}\x1b[1m{algo_trim}\x1b[0m | \x1b[1mPool:\x1b[0m {pool_color}\x1b[1m{}\x1b[0m | \x1b[1mRatio:\x1b[0m {ratio_color}\x1b[1m{:.1}:1\x1b[0m",
+                                        format_size(pool / 1024), ratio
                                     )
                                 }
-                                _ => format!("\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m (\x1b[38;2;255;255;0mRequires sudo for detailed stats\x1b[0m)"),
+                                _ => format!("\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m (\x1b[38;2;255;255;0m\x1b[1mRequires sudo for detailed stats\x1b[0m)"),
                             }
                         }
                         "N" => format!("\x1b[38;2;255;0;0m\x1b[1mDisabled\x1b[0m"),
@@ -894,38 +896,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
-        let target_col_w = max_w as usize / 2;
-        let print_2col_grid = |row: &mut u16, items: &[String], stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
-            let mut i = 0;
-            while i < items.len() {
-                let item1 = &items[i];
-                let len1 = strip_ansi(item1);
-
-                if i + 1 < items.len() && len1 + 3 < target_col_w {
-                    let item2 = &items[i+1];
-                    let pad = " ".repeat(target_col_w.saturating_sub(len1 + 3));
-                    print_line(row, format!("{}{pad} | {}", item1, item2), stdout)?;
-                    i += 2;
-                } else {
-                    print_line(row, item1.clone(), stdout)?;
-                    i += 1;
-                }
-            }
-            Ok(())
-        };
-
+        // Render Dynamic Header Blocks
         let version = env!("CARGO_PKG_VERSION");
         print_line(&mut row, format!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
-        
-        // Brand Dynamic Parser injects official architecture Hex Colors directly into the stream
+       
         let cpu_model_display = state.cpu_model
-            .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m") // AMD Red
-            .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m") // Intel Blue
-            .replace("Apple", "\x1b[1;38;2;192;192;192mApple\x1b[0m\x1b[1m") // Apple Silver
-            .replace("ARM", "\x1b[1;38;2;0;193;222mARM\x1b[0m\x1b[1m") // ARM Teal
-            .replace("RISC-V", "\x1b[1;38;2;155;81;224mRISC-V\x1b[0m\x1b[1m") // RISC-V Purple
-            .replace("IBM", "\x1b[1;38;2;31;112;193mIBM\x1b[0m\x1b[1m"); // IBM Blue
-            
+            .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m")
+            .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m")
+            .replace("Apple", "\x1b[1;38;2;192;192;192mApple\x1b[0m\x1b[1m")
+            .replace("ARM", "\x1b[1;38;2;0;193;222mARM\x1b[0m\x1b[1m")
+            .replace("RISC-V", "\x1b[1;38;2;155;81;224mRISC-V\x1b[0m\x1b[1m")
+            .replace("IBM", "\x1b[1;38;2;31;112;193mIBM\x1b[0m\x1b[1m");
+           
         print_line(&mut row, format!("\x1b[1m{}\x1b[0m", cpu_model_display), &mut stdout)?;
 
         match state.limits {
@@ -946,6 +928,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_line(&mut row, format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m{}IDLE {}\x1b[0m", get_idle_color(idle_secs), format_idle_time(idle_secs)), &mut stdout)?;
         }
 
+        // Render Dynamic CPU Temps
         for (parent, chiplets) in &state.cpu_temps {
             if chiplets.len() > 4 {
                 print_line(&mut row, format!("\x1b[1mCPU Temps ({}):\x1b[0m", parent), &mut stdout)?;
@@ -992,14 +975,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         get_cpu_color((freq - min) / (max - min))
                     } else { String::new() };
 
-                    let (display_freq, unit) = if freq >= 1_000_000.0 { (freq / 1_000_000.0, "THz") } 
-                    else if freq >= 1000.0 { (freq / 1000.0, "GHz") } 
+                    let (display_freq, unit) = if freq >= 1_000_000.0 { (freq / 1_000_000.0, "THz") }
+                    else if freq >= 1000.0 { (freq / 1000.0, "GHz") }
                     else { (freq, "MHz") };
-                    
+                   
                     let sep = if c < cols - 1 { " | " } else { "" };
-                    
                     let freq_str = format_dynamic_6(display_freq);
-                    
+                   
                     write!(stdout, "C{:02}: {}{} {}\x1b[0m{}", idx, color, freq_str, unit, sep)?;
                 }
             }
@@ -1013,7 +995,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             row += 1;
         }
 
-        // --- Memory Formatting ---
+        // --- Memory & Swap Formatting ---
         print_line(&mut row, format!("\x1b[1mRAM:\x1b[0m {}", state.mem_ram_str), &mut stdout)?;
         print_line(&mut row, format!("\x1b[1mZswap:\x1b[0m {}", state.mem_zswap_str), &mut stdout)?;
         print_line(&mut row, format!("\x1b[1mSwap:\x1b[0m {}", state.mem_swap_total_str), &mut stdout)?;
@@ -1021,19 +1003,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut swap_nodes = Vec::new();
         for swap in &state.swaps {
             let col = get_swap_color(swap.percent);
-            swap_nodes.push(format!("{}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / {col}{}\x1b[0m \x1b[0;37mTotal\x1b[0m / {col}{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
+            // Compact child swap representation: removed %Used key/value pair as requested
+            swap_nodes.push(format!("{}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / {col}{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
                 swap.name,
                 format_size(swap.used),
                 format_size(swap.size),
-                swap.percent * 100.0,
                 col=col
             ));
         }
-        print_2col_grid(&mut row, &swap_nodes, &mut stdout)?;
+
+        // --- Unified 2-Column Grid Alignment Logic ---
+        // Dynamically calculates the longest 1st column item across both Swap and Network nodes.
+        // Ensures the '|' divider aligns identically for both grids, with Column 2 left-justified 1 space from '|'.
+        let mut unified_col1_w = 0;
+        for grid_items in [&swap_nodes, &state.net_stats] {
+            let mut i = 0;
+            while i < grid_items.len() {
+                let len = strip_ansi(&grid_items[i]);
+                if len > unified_col1_w {
+                    unified_col1_w = len;
+                }
+                i += 2; // Column 1 candidates
+            }
+        }
+
+        let print_aligned_2col_grid = |row: &mut u16, items: &[String], stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
+            let mut i = 0;
+            while i < items.len() {
+                let item1 = &items[i];
+                let len1 = strip_ansi(item1);
+
+                if i + 1 < items.len() {
+                    let item2 = &items[i+1];
+                    let len2 = strip_ansi(item2);
+
+                    // Check if combined column width fits within half or full terminal space
+                    if unified_col1_w + 3 + len2 <= max_w as usize {
+                        let pad = " ".repeat(unified_col1_w.saturating_sub(len1));
+                        print_line(row, format!("{}{} | {}", item1, pad, item2), stdout)?;
+                        i += 2;
+                        continue;
+                    }
+                }
+                print_line(row, item1.clone(), stdout)?;
+                i += 1;
+            }
+            Ok(())
+        };
+
+        print_aligned_2col_grid(&mut row, &swap_nodes, &mut stdout)?;
 
         // --- Network Grid Formatting ---
         print_line(&mut row, state.net_total_str.clone(), &mut stdout)?;
-        print_2col_grid(&mut row, &state.net_stats, &mut stdout)?;
+        print_aligned_2col_grid(&mut row, &state.net_stats, &mut stdout)?;
 
         stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
         stdout.flush()?;
