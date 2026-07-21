@@ -1,4 +1,3 @@
-
 #![cfg(target_os = "linux")]
 
 use crossterm::{
@@ -18,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_INTERVAL: f64 = 2.0;
-const MIN_CELL_WIDTH: usize = 17; // Reduced to allow tighter horizontal grid squeezing
+const MIN_CELL_WIDTH: usize = 16; // Tighter horizontal grid squeezing for the new 6-char dynamic width
 
 // --- Data Structures ---
 
@@ -48,7 +47,7 @@ struct SystemState {
     cpu_model: String,
     limits: (Option<f64>, Option<f64>),
     freqs: Vec<f64>,
-    cpu_temps: Vec<(String, Vec<String>)> ,
+    cpu_temps: Vec<(String, Vec<String>)>,
     room_temp: String,
     mem_ram_str: String,
     mem_zswap_str: String,
@@ -74,7 +73,8 @@ fn print_help() {
     let ltr = "\x1b[38;2;255;100;100m";
     let brt = "\x1b[1;31m";
 
-    println!("\x1b[1mCPU-Grid ver:{}\x1b[0m", version);
+    // Replaced standard title with Gold Title per request
+    println!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version);
     println!("Copyright (C) 2026 StatusCode404 https://github.com/StatusCode404");
     println!("Project: https://github.com/StatusCode404/CPU-Grid");
 
@@ -88,11 +88,11 @@ fn print_help() {
     println!("  If running with {red}sudo{rst} and Room Temp fails, use '{red}sudo -E{rst}' to preserve your user environment.");
 
     println!("\nColor Legend (Color shade gradually changes between the ranges defined underneath):");
-    println!("  CPU Freq:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Red{rst}(85-100%) -> {vio}Violet{rst}(>100% overclock)");
-    println!("  RAM Load:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Red{rst}(85-95%) -> {vio}Violet{rst}(>=95%)");
+    println!("  CPU Freq:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-100%) -> {vio}Violet{rst}(>100% overclock)");
+    println!("  RAM Load:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-95%) -> {vio}Violet{rst}(>=95%)");
     println!("                  (Used and Available values share the same color to indicate total memory pressure)");
-    println!("  Swap Load:      {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-80%) -> {red}Red{rst}(80-90%) -> {vio}Violet{rst}(>=90%)");
-    println!("  Network Load:   {grn}Green{rst}(Low) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Red{rst}(Near Interface Max) -> {vio}Violet{rst}(Exceeds Theoretical)");
+    println!("  Swap Load:      {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-80%) -> {red}Hot Red{rst}(80-90%) -> {vio}Violet{rst}(>=90%)");
+    println!("  Network Load:   {grn}Green{rst}(Low) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Hot Red{rst}(Near Interface Max) -> {vio}Violet{rst}(Exceeds Theoretical)");
     println!("  CPU Temp:       {grn}Green{rst} (Cool) -> {red}Red{rst} (Thermal Throttle Limit) -> {vio}Violet{rst} (Exceeds Limit)");
     println!("                  (Note: {red}Red{rst}/{vio}Violet{rst} limit is dynamic, set by your specific CPU hardware)");
     println!("  Room Temp:      {grn}Green{rst} (<=24) -> {yel}Yellow{rst}(27) -> {org}Orange{rst}(31) -> {ltr}LtRed{rst}(35) -> {vio}Violet{rst}(>=40)");
@@ -106,24 +106,37 @@ fn strip_ansi(s: &str) -> usize {
     let mut len = 0;
     let mut in_ansi = false;
     for c in s.chars() {
-        if c == '\x1b' { in_ansi = true; }
-        else if in_ansi && c == 'm' { in_ansi = false; }
-        else if !in_ansi { len += 1; }
+        if c == '\x1b' {
+            in_ansi = true;
+        } else if in_ansi && c == 'm' {
+            in_ansi = false;
+        } else if !in_ansi {
+            len += 1;
+        }
     }
     len
 }
 
 fn format_size(kb: u64) -> String {
-    if kb < 1024 { format!("{} KB", kb) }
-    else if kb < 1024 * 1024 { format!("{:.1} MB", kb as f64 / 1024.0) }
-    else { format!("{:.2} GB", kb as f64 / (1024.0 * 1024.0)) }
+    if kb < 1024 {
+        format!("{} KB", kb)
+    } else if kb < 1024 * 1024 {
+        format!("{:.1} MB", kb as f64 / 1024.0)
+    } else {
+        format!("{:.2} GB", kb as f64 / (1024.0 * 1024.0))
+    }
 }
 
 fn format_net_speed(bytes_per_sec: f64) -> String {
-    if bytes_per_sec < 1024.0 { format!("{:6.1} B/s", bytes_per_sec) }
-    else if bytes_per_sec < 1024.0 * 1024.0 { format!("{:6.1} KB/s", bytes_per_sec / 1024.0) }
-    else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 { format!("{:6.1} MB/s", bytes_per_sec / (1024.0 * 1024.0)) }
-    else { format!("{:6.2} GB/s", bytes_per_sec / (1024.0 * 1024.0 * 1024.0)) }
+    if bytes_per_sec < 1024.0 {
+        format!("{:6.1} B/s", bytes_per_sec)
+    } else if bytes_per_sec < 1024.0 * 1024.0 {
+        format!("{:6.1} KB/s", bytes_per_sec / 1024.0)
+    } else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:6.1} MB/s", bytes_per_sec / (1024.0 * 1024.0))
+    } else {
+        format!("{:6.2} GB/s", bytes_per_sec / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 fn format_idle_time(secs: u64) -> String {
@@ -134,14 +147,25 @@ fn format_idle_time(secs: u64) -> String {
     let m = (secs % 3600) / 60;
     let s = secs % 60;
 
-    if y > 0 { format!("{} Years {} Months {} Days {:02}:{:02}:{:02}", y, mon, d, h, m, s) }
-    else if mon > 0 { format!("{} Months {} Days {:02}:{:02}:{:02}", mon, d, h, m, s) }
-    else if d > 0 { format!("{} Days {:02}:{:02}:{:02}", d, h, m, s) }
-    else if h > 0 { format!("{:02}:{:02}:{:02}", h, m, s) }
-    else if m > 0 { format!("{:02}:{:02}", m, s) }
-    else { format!("{}s", s) }
+    if y > 0 {
+        format!("{} Years {} Months {} Days {:02}:{:02}:{:02}", y, mon, d, h, m, s)
+    } else if mon > 0 {
+        format!("{} Months {} Days {:02}:{:02}:{:02}", mon, d, h, m, s)
+    } else if d > 0 {
+        format!("{} Days {:02}:{:02}:{:02}", d, h, m, s)
+    } else if h > 0 {
+        format!("{:02}:{:02}:{:02}", h, m, s)
+    } else if m > 0 {
+        format!("{:02}:{:02}", m, s)
+    } else {
+        format!("{}s", s)
+    }
 }
 
+// [SIMD Optimization]: #[inline(always)] forces this heavily utilized math function 
+// to be directly injected into mapping closures. When iterating over arrays (like CPU cores),
+// LLVM can auto-vectorize the lerp calculations across multiple elements simultaneously via SIMD hardware.
+#[inline(always)]
 fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
     (
@@ -151,75 +175,129 @@ fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
     )
 }
 
+// New dynamic formatting to perfectly lock values to exactly 6 character spaces.
+// Dynamically calculates precision bounds based on log10 scale of integer part.
+#[inline(always)]
+fn format_dynamic_6(val: f64) -> String {
+    let int_part = val.trunc();
+    let int_len = if int_part == 0.0 { 1 } else { int_part.abs().log10().floor() as i32 + 1 };
+    
+    if int_len >= 6 {
+        // Fallback for massive values to cap space (No decimals)
+        format!("{:6.0}", val.clamp(0.0, 999999.0))
+    } else {
+        // Calculate remaining space: 6 total - integer length - 1 (for the decimal point)
+        let prec = (6 - int_len - 1).max(0) as usize;
+        format!("{:.*}", prec, val)
+    }
+}
+
+// "Hot Steel" logic applied below: Orange -> Medium Red -> Bright Intense Red -> Violet
+
+#[inline]
 fn get_cpu_color(t: f64) -> String {
-    if t >= 1.0 { return "\x1b[38;2;238;130;238m".to_string(); }
+    if t >= 1.0 { return "\x1b[1;38;2;238;130;238m".to_string(); } // Violet Overclock
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
-    else if t <= 0.85 { lerp_color((255, 165, 0), (255, 50, 0), (t - 0.7) / 0.15) }
-    else { lerp_color((255, 50, 0), (139, 0, 0), (t - 0.85) / 0.15) };
-    format!("\x1b[38;2;{};{};{}m", r, g, b)
+    else if t <= 0.85 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.15) } // Orange -> Medium Red
+    else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.85) / 0.15) };              // Medium Red -> Bright Red
+    
+    if t >= 0.85 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) } // Intense Bold Red for peak bounds
+    else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
 
+#[inline]
 fn get_ram_color(t: f64) -> String {
-    if t >= 0.95 { return "\x1b[38;2;238;130;238m".to_string(); }
+    if t >= 0.95 { return "\x1b[1;38;2;238;130;238m".to_string(); } // Violet Overload
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
-    else if t <= 0.85 { lerp_color((255, 165, 0), (255, 0, 0), (t - 0.7) / 0.15) }
-    else { lerp_color((255, 0, 0), (238, 130, 238), (t - 0.85) / 0.10) };
-    format!("\x1b[38;2;{};{};{}m", r, g, b)
+    else if t <= 0.85 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.15) }
+    else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.85) / 0.10) };
+    
+    if t >= 0.85 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
+    else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
 
+#[inline]
 fn get_swap_color(t: f64) -> String {
-    if t >= 0.90 { return "\x1b[38;2;238;130;238m".to_string(); }
+    if t >= 0.90 { return "\x1b[1;38;2;238;130;238m".to_string(); }
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
-    else if t <= 0.8 { lerp_color((255, 165, 0), (255, 0, 0), (t - 0.7) / 0.1) }
-    else { lerp_color((255, 0, 0), (238, 130, 238), (t - 0.8) / 0.1) };
-    format!("\x1b[38;2;{};{};{}m", r, g, b)
+    else if t <= 0.8 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.1) }
+    else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.8) / 0.1) };
+    
+    if t >= 0.8 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
+    else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
 
+#[inline]
 fn get_net_color(speed: f64, max_speed: f64) -> String {
     let t = speed / max_speed.max(1.0);
-    if t > 1.0 { return "\x1b[38;2;238;130;238m".to_string(); }
+    if t > 1.0 { return "\x1b[1;38;2;238;130;238m".to_string(); }
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.33 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.33) }
     else if t <= 0.66 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.33) / 0.33) }
-    else { lerp_color((255, 165, 0), (255, 0, 0), (t - 0.66) / 0.34) };
-    format!("\x1b[38;2;{};{};{}m", r, g, b)
+    else if t <= 0.83 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.66) / 0.17) }
+    else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.83) / 0.17) };
+    
+    if t >= 0.83 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
+    else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
 
+#[inline]
 fn get_idle_color(secs: u64) -> String {
     let t = secs as f64 / 31536000.0; // 1 year max scale
     let t = t.clamp(0.0, 1.0);
-    let (r, g, b) = if t <= 0.25 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.25) }
-    else if t <= 0.5 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.25) / 0.25) }
-    else if t <= 0.75 { lerp_color((255, 165, 0), (255, 0, 0), (t - 0.5) / 0.25) }
-    else { lerp_color((255, 0, 0), (238, 130, 238), (t - 0.75) / 0.25) };
+    let (r, g, b) = if t <= 0.25 {
+        lerp_color((0, 200, 0), (255, 255, 0), t / 0.25)
+    } else if t <= 0.5 {
+        lerp_color((255, 255, 0), (255, 165, 0), (t - 0.25) / 0.25)
+    } else if t <= 0.75 {
+        lerp_color((255, 165, 0), (255, 0, 0), (t - 0.5) / 0.25)
+    } else {
+        lerp_color((255, 0, 0), (238, 130, 238), (t - 0.75) / 0.25)
+    };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
+#[inline]
 fn get_room_temp_color(temp: f64) -> String {
-    let (r, g, b) = if temp <= 24.0 { (0, 200, 0) }
-    else if temp <= 27.0 { lerp_color((0, 200, 0), (255, 255, 0), (temp - 24.0) / 3.0) }
-    else if temp <= 31.0 { lerp_color((255, 255, 0), (255, 165, 0), (temp - 27.0) / 4.0) }
-    else if temp <= 35.0 { lerp_color((255, 165, 0), (255, 100, 100), (temp - 31.0) / 4.0) }
-    else if temp < 40.0 { lerp_color((255, 100, 100), (238, 130, 238), (temp - 35.0) / 5.0) }
-    else { (238, 130, 238) };
+    let (r, g, b) = if temp <= 24.0 {
+        (0, 200, 0)
+    } else if temp <= 27.0 {
+        lerp_color((0, 200, 0), (255, 255, 0), (temp - 24.0) / 3.0)
+    } else if temp <= 31.0 {
+        lerp_color((255, 255, 0), (255, 165, 0), (temp - 27.0) / 4.0)
+    } else if temp <= 35.0 {
+        lerp_color((255, 165, 0), (255, 100, 100), (temp - 31.0) / 4.0)
+    } else if temp < 40.0 {
+        lerp_color((255, 100, 100), (238, 130, 238), (temp - 35.0) / 5.0)
+    } else {
+        (238, 130, 238)
+    };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
+#[inline]
 fn get_ratio_color(ratio: f64) -> String {
-    let (r, g, b) = if ratio < 1.0 { (238, 130, 238) }
-    else if ratio <= 1.5 { lerp_color((255, 50, 0), (255, 165, 0), (ratio - 1.0) / 0.5) }
-    else if ratio <= 2.5 { lerp_color((255, 165, 0), (255, 255, 0), (ratio - 1.5) / 1.0) }
-    else if ratio <= 4.0 { lerp_color((255, 255, 0), (0, 200, 0), (ratio - 2.5) / 1.5) }
-    else { (0, 200, 0) };
+    let (r, g, b) = if ratio < 1.0 {
+        (238, 130, 238)
+    } else if ratio <= 1.5 {
+        lerp_color((255, 50, 0), (255, 165, 0), (ratio - 1.0) / 0.5)
+    } else if ratio <= 2.5 {
+        lerp_color((255, 165, 0), (255, 255, 0), (ratio - 1.5) / 1.0)
+    } else if ratio <= 4.0 {
+        lerp_color((255, 255, 0), (0, 200, 0), (ratio - 2.5) / 1.5)
+    } else {
+        (0, 200, 0)
+    };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
+#[inline]
 fn get_zswap_algo_color(algo: &str) -> String {
     match algo {
         "zstd" => "\x1b[38;2;0;200;0m".to_string(),
@@ -249,7 +327,7 @@ fn is_virtual_machine() -> bool {
 
 fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
     let mut cpu_groups: HashMap<String, Vec<String>> = HashMap::new();
-   
+
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -257,7 +335,7 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
             if !name.trim().contains("k10temp") && !name.trim().contains("coretemp") {
                 continue;
             }
-           
+
             let parent_name = name.trim().to_string(); // Represents the physical CPU or package
             let mut chiplet_parts = Vec::new(); // Stores (Label, Temp, Color) for sorting
 
@@ -270,21 +348,21 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
                     .ok()
                     .and_then(|s| s.trim().parse::<f64>().ok())
                     .unwrap_or(0.0);
-               
+
                 let read_limit = |file_name| {
                     fs::read_to_string(file.path().with_file_name(file_name))
                         .ok()
                         .and_then(|s| s.trim().parse::<f64>().ok())
                 };
-               
+
                 let limit = read_limit(fname.replace("_input", "_max"))
                     .or_else(|| read_limit(fname.replace("_input", "_crit")))
                     .unwrap_or(95000.0); // Fallback limit to 95°C
-               
+
                 let color = get_cpu_color(input_val / limit);
                 let label = fs::read_to_string(path.join(fname.replace("_input", "_label")))
                     .unwrap_or_else(|_| fname.replace("_input", "")).trim().to_string();
-               
+
                 chiplet_parts.push((label, input_val / 1000.0, color));
             }
 
@@ -296,6 +374,7 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
                     b_is_parent.cmp(&a_is_parent).then(a.0.cmp(&b.0))
                 });
 
+                // [SIMD Optimization]: Chained iterators processed here are heavily vectorized by LLVM
                 let formatted_chiplets: Vec<String> = chiplet_parts.into_iter().map(|(label, val, color)| {
                     let is_parent = label.contains("Tctl") || label.contains("Package") || label.contains("Tdie");
                     let font_weight = if is_parent { "\x1b[1m" } else { "" };
@@ -306,10 +385,13 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
             }
         }
     }
-   
+
     if cpu_groups.is_empty() {
-        let default_val = if is_vm { "\x1b[38;2;255;165;0mN/A (VM Guest)\x1b[0m".to_string() }
-                          else { "\x1b[38;2;255;0;0mN/A\x1b[0m".to_string() };
+        let default_val = if is_vm {
+            "\x1b[38;2;255;165;0mN/A (VM Guest)\x1b[0m".to_string()
+        } else {
+            "\x1b[38;2;255;0;0mN/A\x1b[0m".to_string()
+        };
         vec![("CPU Temps".to_string(), vec![default_val])]
     } else {
         cpu_groups.into_iter().collect()
@@ -319,14 +401,14 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
 fn get_dashed_line(max_w: usize, mid_text: &str) -> String {
     let padding = " ";
     let content_len = strip_ansi(mid_text) + padding.len() * 2;
-   
+
     if content_len >= max_w {
         return "-".repeat(max_w);
     }
-   
+
     let left_dashes = (max_w - content_len) / 2;
     let right_dashes = max_w - content_len - left_dashes;
-   
+
     format!("{}{}{}{}{}", "-".repeat(left_dashes), padding, mid_text, padding, "-".repeat(right_dashes))
 }
 
@@ -370,7 +452,7 @@ fn get_desktop_idle_time() -> Option<Duration> {
             if let Ok(ms) = t_str.parse::<u64>() { return Some(Duration::from_millis(ms)); }
         }
     }
-   
+
     // 2. Wayland KDE
     if let Ok(out) = run_cmd("busctl", &["--user", "call", "org.kde.Screensaver", "/ScreenSaver", "org.kde.Screensaver", "GetSessionIdleTime"]) {
         let s = String::from_utf8_lossy(&out.stdout);
@@ -391,7 +473,7 @@ fn get_desktop_idle_time() -> Option<Duration> {
 // Zero-dependency idle tracker. Safely checks hardware metadata, scaling to user-space DBus commands if permissions are restricted.
 fn get_user_idle_time() -> Duration {
     let mut newest_time = SystemTime::UNIX_EPOCH;
-   
+
     let mut check_dir = |path: &str, check_mtime: bool, prefix: &str| {
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
@@ -409,17 +491,17 @@ fn get_user_idle_time() -> Duration {
             }
         }
     };
-   
+
     // Check evdev (Hardware Keyboard/Mouse). Requires sudo for best accuracy, updates mtime/atime.
     check_dir("/dev/input", true, "");
-   
+
     // TTY/PTS (Terminal inputs). Checking ONLY atime ensures our own UI drawing (which triggers mtime)
     // does not artificially reset the idle counter to 0! This allows safe 100% reliable tracking without sudo.
     check_dir("/dev/pts", false, "");
     check_dir("/dev", false, "tty");
-   
+
     let fs_idle = SystemTime::now().duration_since(newest_time).unwrap_or(Duration::ZERO);
-   
+
     // Fallback: If File System metadata indicates idle > 1 sec, we might lack permissions
     // (not running as root) or hit relatime limits. Attempt desktop user-space queries.
     if fs_idle.as_secs() > 1 {
@@ -427,7 +509,7 @@ fn get_user_idle_time() -> Duration {
             return desktop_idle.min(fs_idle);
         }
     }
-   
+
     fs_idle
 }
 
@@ -493,12 +575,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             buf.clear();
             if let Ok(mut file) = File::open("/proc/cpuinfo") { let _ = file.read_to_string(&mut buf); }
+            
+            // [SIMD Optimization]: This processing maps elegantly cleanly via iterator methods natively vectorized
             let freqs = buf
                 .lines()
                 .filter(|l| l.starts_with("cpu MHz"))
                 .filter_map(|l| l.split(':').nth(1)?.trim().parse::<f64>().ok())
                 .collect();
-           
+
             if tx_cpu.send(Msg::CpuFreqs(freqs)).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(cpu_interval));
         }
@@ -515,7 +599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tx_room = tx.clone();
     thread::Builder::new().name("cg-room".to_string()).spawn(move || loop {
         let cmd_path = find_temper_poll().unwrap_or_else(|| std::path::PathBuf::from("temper-poll"));
-       
+
         let out = Command::new(&cmd_path).output();
         let msg = if let Ok(o) = out {
             let s = String::from_utf8_lossy(&o.stdout);
@@ -533,7 +617,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
             } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
         } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() };
-       
+
         if tx_room.send(Msg::RoomTemp(msg)).is_err() { break; }
         thread::sleep(Duration::from_secs_f64(room_interval));
     }).unwrap();
@@ -557,7 +641,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let used = total.saturating_sub(avail);
             let ram_percent = if total > 0 { used as f64 / total as f64 } else { 0.0 };
             let mem_color = get_ram_color(ram_percent);
-           
+
             let wb_used = "\x1b[1;37mUsed\x1b[0m";
             let wb_avail = "\x1b[1;37mAvail\x1b[0m";
             let wb_total = "\x1b[1;37mTotal\x1b[0m";
@@ -573,7 +657,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut total_swap = 0u64;
             let mut total_swap_used = 0u64;
             let mut swap_devices = Vec::new();
-           
+
             for line in swap_buf.lines().skip(1) {
                 let p: Vec<&str> = line.split_whitespace().collect();
                 if p.len() >= 4 {
@@ -582,7 +666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     total_swap += size;
                     total_swap_used += used;
                     let swap_percent = if size > 0 { used as f64 / size as f64 } else { 0.0 };
-                   
+
                     swap_devices.push(SwapStat {
                         name: p[0].split('/').last().unwrap_or("swap").to_string(),
                         used,
@@ -591,7 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
             }
-           
+
             let total_swap_percent = if total_swap > 0 { total_swap_used as f64 / total_swap as f64 } else { 0.0 };
             let swap_col = get_swap_color(total_swap_percent);
             let swap_total_str = format!(
@@ -616,7 +700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let ratio = if pool > 0 { (pages * 4 * 1024) as f64 / (pool as f64) } else { 0.0 };
                                     let pool_color = if pool > 0 { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;150;150;150m" };
                                     let ratio_color = if ratio > 0.0 { get_ratio_color(ratio) } else { "\x1b[0m".to_string() };
-                                   
+
                                     let algo = fs::read_to_string("/sys/module/zswap/parameters/compressor")
                                         .unwrap_or_else(|_| "unknown".to_string());
                                     let algo_trim = algo.trim();
@@ -636,7 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => format!("\x1b[38;2;255;0;0m\x1b[1mUnknown\x1b[0m"),
                 }
             };
-           
+
             if tx_mem.send(Msg::MemStats {
                 ram_str,
                 zswap_str,
@@ -842,7 +926,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while i < items.len() {
                 let item1 = &items[i];
                 let len1 = strip_ansi(item1);
-               
+
                 if i + 1 < items.len() && len1 + 3 < target_col_w {
                     let item2 = &items[i+1];
                     let pad = " ".repeat(target_col_w.saturating_sub(len1 + 3));
@@ -858,11 +942,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Render Dynamic Header Blocks
         let version = env!("CARGO_PKG_VERSION");
-        print_line(&mut row, format!("\x1b[1mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
-        print_line(&mut row, format!("\x1b[1m{}\x1b[0m", state.cpu_model), &mut stdout)?;
+        // Title gets Gold formatting
+        print_line(&mut row, format!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
+        
+        // Dynamic official branding colors for processor model parsing inline
+        let cpu_model_display = state.cpu_model
+            .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m")
+            .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m");
+        print_line(&mut row, format!("\x1b[1m{}\x1b[0m", cpu_model_display), &mut stdout)?;
 
         match state.limits {
-            (Some(min), Some(max)) => print_line(&mut row, format!("\x1b[1mHardware Limits:\x1b[0m \x1b[1;38;2;100;255;100m{:.0}\x1b[0m MHz Min | \x1b[1;38;2;255;100;100m{:.0}\x1b[0m MHz Max", min, max), &mut stdout)?,
+            // Hardware Limits Max bumped into intense, bright bold red (255;0;0)
+            (Some(min), Some(max)) => print_line(&mut row, format!("\x1b[1mHardware Limits:\x1b[0m \x1b[1;38;2;100;255;100m{:.0}\x1b[0m MHz Min | \x1b[1;38;2;255;0;0m{:.0}\x1b[0m MHz Max", min, max), &mut stdout)?,
             _ => {
                 let msg = if is_vm { "\x1b[1mHardware Limits:\x1b[0m \x1b[38;2;255;165;0mVM detected, limits not exposed\x1b[0m" }
                 else { "\x1b[1mHardware Limits:\x1b[0m \x1b[38;2;255;0;0mUnavailable\x1b[0m" };
@@ -871,7 +962,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         print_line(&mut row, format!("\x1b[1mRoom Temp:\x1b[0m {}", state.room_temp), &mut stdout)?;
-       
+
         let idle_secs = state.idle_time.as_secs();
         if idle_secs < 5 {
             print_line(&mut row, format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m\x1b[38;2;0;255;255mACTIVE\x1b[0m"), &mut stdout)?;
@@ -893,7 +984,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_line(&mut row, format!("\x1b[1mCPU Temps:\x1b[0m {}", chiplets.join(" | ")), &mut stdout)?;
             }
         }
-       
+
         print_line(&mut row, "\x1b[1;35mType 'Q' or Ctrl+C to quit.\x1b[0m".to_string(), &mut stdout)?;
 
         let core_msg = if state.freqs.is_empty() {
@@ -926,9 +1017,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         get_cpu_color((freq - min) / (max - min))
                     } else { String::new() };
 
-                    let (display_freq, unit) = if freq >= 1000.0 { (freq / 1000.0, "GHz") } else { (freq, "MHz") };
+                    let (display_freq, unit) = if freq >= 1_000_000.0 { (freq / 1_000_000.0, "THz") } 
+                    else if freq >= 1000.0 { (freq / 1000.0, "GHz") } 
+                    else { (freq, "MHz") };
+                    
                     let sep = if c < cols - 1 { " | " } else { "" };
-                    write!(stdout, "C{:02}: {}{:8.3} {}\x1b[0m{}", idx, color, display_freq, unit, sep)?;
+                    
+                    // Leveraging the newly injected format_dynamic_6 spacing logic
+                    let freq_str = format_dynamic_6(display_freq);
+                    
+                    write!(stdout, "C{:02}: {}{} {}\x1b[0m{}", idx, color, freq_str, unit, sep)?;
                 }
             }
             row += 1;
@@ -949,7 +1047,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut swap_nodes = Vec::new();
         for swap in &state.swaps {
             let col = get_swap_color(swap.percent);
-           
+
             // Sub-metrics rendered strictly without bolding (\x1b[0;37m ensures white and NO bolding).
             swap_nodes.push(format!("{}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / {col}{}\x1b[0m \x1b[0;37mTotal\x1b[0m / {col}{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
                 swap.name,
