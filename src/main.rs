@@ -1,3 +1,4 @@
+
 #![cfg(target_os = "linux")]
 
 use crossterm::{
@@ -28,21 +29,59 @@ struct TempStat {
     is_parent: bool,
 }
 
+// Persistently tracks High Watermark historical peaks. Delay prevents UI color flickering on bursts.
+struct HrHwState {
+    current_r: f64,
+    pending_r: f64,
+    pending_time_r: Instant,
+    current_w: f64,
+    pending_w: f64,
+    pending_time_w: Instant,
+}
+
+impl HrHwState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self { current_r: 0.0, pending_r: 0.0, pending_time_r: now, current_w: 0.0, pending_w: 0.0, pending_time_w: now }
+    }
+    fn update(&mut self, r: f64, w: f64) {
+        if r > self.pending_r {
+            self.pending_r = r;
+            self.pending_time_r = Instant::now();
+        }
+        // Absolute max logic: once current_r/w is established, it strictly holds the highest recorded value
+        if self.pending_r > self.current_r && self.pending_time_r.elapsed().as_secs_f64() >= 1.5 {
+            self.current_r = self.pending_r;
+        }
+
+        if w > self.pending_w {
+            self.pending_w = w;
+            self.pending_time_w = Instant::now();
+        }
+        if self.pending_w > self.current_w && self.pending_time_w.elapsed().as_secs_f64() >= 1.5 {
+            self.current_w = self.pending_w;
+        }
+    }
+}
+
 enum Msg {
     CpuFreqs(Vec<f64>),
-    CpuTemps(Vec<(String, Vec<TempStat>)>), // Parent CPU/Adapter, Vec of Chiplet data
+    CpuTemps(Vec<(String, Vec<TempStat>)>),
     RoomTemp(String),
     MemStats {
         ram_str: String,
         zswap_str: String,
         swap_total_str: String,
-        swaps_formatted: Vec<String>, // Formatted in background thread to prevent UI heap fragmentation
+        swaps_formatted: Vec<String>,
     },
-    NetStats(Vec<(String, f64, f64, f64)>), // Interface, Rx Speed, Tx Speed, Max Speed
-    NetEvent(String, String),               // Interface Name, Event String (ACTIVATED/DEACTIVATED)
+    NetStats(Vec<(String, f64, f64, f64)>),
+    NetEvent(String, String),              
     DiskStats {
-        disk_total_str: String,
-        disks_formatted: Vec<String>,
+        disk_cap_parent: String,
+        disk_io_parent: String,
+        disk_combined_parent: String,
+        disk_cap_nodes: Vec<String>,
+        disk_io_nodes: Vec<String>,
     },
     UserIdle(Duration),
 }
@@ -60,8 +99,11 @@ struct SystemState {
     net_total_str: String,
     net_stats: Vec<String>,
     net_events: HashMap<String, (String, Instant)>,
-    disk_total_str: String,
-    disks_formatted: Vec<String>,
+    disk_cap_parent: String,
+    disk_io_parent: String,
+    disk_combined_parent: String,
+    disk_cap_nodes: Vec<String>,
+    disk_io_nodes: Vec<String>,
     idle_time: Duration,
 }
 
@@ -85,10 +127,13 @@ fn print_help() {
     println!("Compatibility: Full support for x86, ARM (incl. Apple Silicon), RISC-V, and IBM processor architectures via standard Linux kernel sysfs interfaces.");
 
     println!("\nUsage (Values are in seconds. Parameters given less than or greater than the boundary ranges will fall back to the nearest boundary range.):");
-    println!("  -n[<secs>]    Interval for CPU stats (0.1 - 60s, default 2.0)");
-    println!("  -r[<secs>]    Interval for Room Temp (1 - 3600s, default 2.0)");
-    println!("  -m[<secs>]    Interval for Memory stats (0.5 - 60s, default 2.0)");
-    println!("  -t[<secs>]    Interval for Network/Disk traffic (0.5 - 60s, default 2.0)");
+    println!("  -n, --cpu-stats-interval <secs>    Interval for CPU stats (0.1 - 60s, default 2.0)");
+    println!("  -r, --room-temp-interval <secs>    Interval for Room Temp (1 - 3600s, default 2.0)");
+    println!("  -m, --mem-stats-interval <secs>    Interval for Memory stats (0.5 - 60s, default 2.0)");
+    println!("  -t, --net-interval <secs>          Interval for Network traffic (0.5 - 60s, default 2.0)");
+    println!("  -d, --disk-interval <secs>         Interval for Storage telemetry (0.5 - 60s, default 2.0)");
+    println!("  -h, --help                         Prints this help document");
+    println!("  -v, --version                      Prints version and copyright");
 
     println!("\nTips:");
     println!("  If running with {red}sudo{rst} and Room Temp fails, use '{red}sudo -E{rst}' to preserve your user environment.");
@@ -99,8 +144,9 @@ fn print_help() {
     println!("                  (Used and Available values share the same color to indicate total memory pressure)");
     println!("  Swap Load:      {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-80%) -> {red}Hot Red{rst}(80-90%) -> {vio}Violet{rst}(>=90%)");
     println!("  Network Load:   {grn}Green{rst}(Low) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Hot Red{rst}(Near Interface Max) -> {vio}Violet{rst}(Exceeds Theoretical)");
-    println!("  Storage Load:   {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-80%) -> {org}Orange{rst}(80-90%) -> {red}Hot Red{rst}(90-95%) -> {vio}Violet{rst}(>=95%)");
+    println!("  Storage Space:  {grn}Green{rst}(0-75%) -> {yel}Yellow{rst}(75-85%) -> {org}Orange{rst}(85-90%) -> {red}Hot Red{rst}(90-95%) -> {vio}Violet{rst}(>=95%)");
     println!("                  (Note: BTRFS/ZFS limits scale earlier to account for Copy-on-Write fragmentation degradation)");
+    println!("  Storage \x1b[1m↓↑\x1b[0m:     {grn}Green{rst}(Baseline) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Hot Red{rst}(Highest Known HW/HR) -> {vio}Violet{rst}(Spiking to New Max)");
     println!("  CPU Temp:       {grn}Green{rst} (Cool) -> {red}Red{rst} (Thermal Throttle Limit) -> {vio}Violet{rst} (Exceeds Limit)");
     println!("  Room Temp:      {grn}Green{rst} (<=24) -> {yel}Yellow{rst}(27) -> {org}Orange{rst}(31) -> {ltr}LtRed{rst}(35) -> {vio}Violet{rst}(>=40)");
     println!("  Zswap Status:   {grn}Green{rst} (Enabled) -> {brt}Bright Red{rst} (Disabled) -> {yel}Yellow{rst} (Unknown Status) -> {vio}Violet{rst} (Not Present)");
@@ -120,7 +166,7 @@ fn strip_ansi(s: &str) -> usize {
     len
 }
 
-// Strictly accepts Bytes and enforces a flawless 6-character value + unit architecture up to Petabytes.
+// Strictly accepts Bytes and enforces a flawless 10-character width exactly aligned (e.g. `  12.3  GB`)
 fn format_size(bytes: u64) -> String {
     let kb = 1024_f64;
     let mb = kb * 1024.0;
@@ -129,15 +175,18 @@ fn format_size(bytes: u64) -> String {
     let pb = tb * 1024.0;
     let val = bytes as f64;
 
-    if val < kb { format!("{:6.0}   B", val) }
-    else if val < mb { format!("{:6.1}  KB", val / kb) }
-    else if val < gb { format!("{:6.1}  MB", val / mb) }
-    else if val < tb { format!("{:6.2}  GB", val / gb) }
-    else if val < pb { format!("{:6.2}  TB", val / tb) }
-    else { format!("{:6.2}  PB", val / pb) }
+    let (v, u) = if val < kb { (val, " B") }
+    else if val < mb { (val / kb, "KB") }
+    else if val < gb { (val / mb, "MB") }
+    else if val < tb { (val / gb, "GB") }
+    else if val < pb { (val / tb, "TB") }
+    else { (val / pb, "PB") };
+
+    if v >= 1000.0 { format!("{:6.0} {}", v, u) }
+    else { format!("{:6.1} {}", v, u) }
 }
 
-// Ensures all speed strings are exactly 11 characters long for perfect arrow vertical alignment
+// Limits standard network bandwidth output to strict characters for vertical alignment
 fn format_net_speed(bytes_per_sec: f64) -> String {
     let kb = 1024_f64;
     let mb = kb * 1024.0;
@@ -149,6 +198,25 @@ fn format_net_speed(bytes_per_sec: f64) -> String {
     else if bytes_per_sec < gb { format!("{:6.1}  MB/s", bytes_per_sec / mb) }
     else if bytes_per_sec < tb { format!("{:6.2}  GB/s", bytes_per_sec / gb) }
     else { format!("{:6.2}  TB/s", bytes_per_sec / tb) }
+}
+
+// Drops precision to .1 universally to save terminal real estate purely for the disk grids, yielding exact 9 chars
+fn format_disk_speed(bytes_per_sec: f64) -> String {
+    let kb = 1024_f64;
+    let mb = kb * 1024.0;
+    let gb = mb * 1024.0;
+    let tb = gb * 1024.0;
+    let pb = tb * 1024.0;
+
+    let (v, u) = if bytes_per_sec < kb { (bytes_per_sec, "B/s") }
+    else if bytes_per_sec < mb { (bytes_per_sec / kb, "K/s") }
+    else if bytes_per_sec < gb { (bytes_per_sec / mb, "M/s") }
+    else if bytes_per_sec < tb { (bytes_per_sec / gb, "G/s") }
+    else if bytes_per_sec < pb { (bytes_per_sec / tb, "T/s") }
+    else { (bytes_per_sec / pb, "P/s") };
+
+    if v >= 1000.0 { format!("{:5.0} {}", v, u) }
+    else { format!("{:5.1} {}", v, u) }
 }
 
 fn format_idle_time(secs: u64) -> String {
@@ -229,20 +297,38 @@ fn get_swap_color(t: f64) -> String {
 }
 
 #[inline]
-fn get_disk_color(t: f64, is_cow: bool) -> String {
-    // Dynamic thresholds based on filesystem architecture idiosyncracies. Btrfs degrades if overfilled.
-    let (t_orange, t_red, t_violet) = if is_cow { (0.50, 0.75, 0.85) } else { (0.80, 0.90, 0.95) };
+fn get_disk_capacity_color(percent: f64, is_cow: bool) -> String {
+    let (t_green, t_yellow, t_orange, t_red) = if is_cow {
+        (0.70, 0.80, 0.90, 0.95) // Adjusted COW threshold to keep 50%+ safe and green
+    } else {
+        (0.80, 0.90, 0.95, 0.98) // Standard formats like Ext4/XFS
+    };
 
-    if t >= t_violet { return "\x1b[1;38;2;238;130;238m".to_string(); }
-    let t = t.clamp(0.0, 1.0);
+    if percent >= t_red { return "\x1b[1;38;2;238;130;238m".to_string(); } // Violet
+    let t = percent.clamp(0.0, 1.0);
    
-    let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
-    else if t <= t_orange { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / (t_orange - 0.5)) }
-    else if t <= t_red { lerp_color((255, 165, 0), (200, 30, 30), (t - t_orange) / (t_red - t_orange)) }
-    else { lerp_color((200, 30, 30), (255, 0, 0), (t - t_red) / (t_violet - t_red)) };
+    let (r, g, b) = if t <= t_green { (0, 200, 0) }
+    else if t <= t_yellow { lerp_color((0, 200, 0), (255, 255, 0), (t - t_green) / (t_yellow - t_green)) }
+    else if t <= t_orange { lerp_color((255, 255, 0), (255, 165, 0), (t - t_yellow) / (t_orange - t_yellow)) }
+    else { lerp_color((255, 165, 0), (255, 0, 0), (t - t_orange) / (t_red - t_orange)) };
    
-    if t >= t_red { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
+    if t >= t_orange { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
     else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
+}
+
+#[inline]
+fn get_exp_disk_speed_color(speed: f64, current_hw: f64) -> String {
+    if speed > current_hw && current_hw > 1024.0 { return "\x1b[1;38;2;238;130;238m".to_string(); }
+    if speed >= current_hw * 0.98 && current_hw > 1024.0 { return "\x1b[1;31m".to_string(); }
+   
+    // Exponential lerp via powf(3.0) allows colors to naturally hold greener ranges significantly longer before exploding toward warm colors at peak speeds.
+    let t = if current_hw > 0.0 { (speed / current_hw).clamp(0.0, 1.0).powf(3.0) } else { 0.0 };
+   
+    let (r, g, b) = if t <= 0.4 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.4) }
+    else if t <= 0.8 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.4) / 0.4) }
+    else { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.8) / 0.2) };
+   
+    format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
 #[inline]
@@ -454,21 +540,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut room_interval = DEFAULT_INTERVAL;
     let mut mem_interval = DEFAULT_INTERVAL;
     let mut net_interval = DEFAULT_INTERVAL;
+    let mut disk_interval = DEFAULT_INTERVAL;
 
     while let Some(arg) = args.next() {
-        if arg == "-h" || arg == "--help" { print_help(); std::process::exit(0); }
-        else if arg.starts_with("-n") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) } else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            cpu_interval = val.clamp(0.1, 60.0);
-        } else if arg.starts_with("-r") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) } else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            room_interval = val.clamp(1.0, 3600.0);
-        } else if arg.starts_with("-m") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) } else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            mem_interval = val.clamp(0.5, 60.0);
-        } else if arg.starts_with("-t") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) } else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            net_interval = val.clamp(0.5, 60.0);
+        match arg.as_str() {
+            "-h" | "--help" => { print_help(); std::process::exit(0); }
+            "-v" | "--version" => {
+                println!("CPU-Grid ver:{}", env!("CARGO_PKG_VERSION"));
+                println!("Copyright (C) 2026 StatusCode404 https://github.com/StatusCode404");
+                std::process::exit(0);
+            }
+            "-n" | "--cpu-stats-interval" => { cpu_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.1, 60.0); }
+            "-r" | "--room-temp-interval" => { room_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(1.0, 3600.0); }
+            "-m" | "--mem-stats-interval" => { mem_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            "-t" | "--net-interval" => { net_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            "-d" | "--disk-interval" => { disk_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            _ => {
+                if arg.starts_with("-n") { cpu_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.1, 60.0); }
+                else if arg.starts_with("-r") { room_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(1.0, 3600.0); }
+                else if arg.starts_with("-m") { mem_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+                else if arg.starts_with("-t") { net_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+                else if arg.starts_with("-d") { disk_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            }
         }
     }
 
@@ -494,11 +587,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tx_cpu = tx.clone();
     thread::Builder::new().name("cg-cpu".to_string()).spawn(move || {
         let mut buf = String::with_capacity(8192);
+        let mut freqs = Vec::with_capacity(128);
         loop {
             buf.clear();
+            freqs.clear();
             if let Ok(mut file) = File::open("/proc/cpuinfo") { let _ = file.read_to_string(&mut buf); }
-            let freqs = buf.lines().filter(|l| l.starts_with("cpu MHz") || l.starts_with("BogoMIPS")).filter_map(|l| l.split(':').nth(1)?.trim().parse::<f64>().ok()).collect();
-            if tx_cpu.send(Msg::CpuFreqs(freqs)).is_err() { break; }
+            for l in buf.lines() {
+                if l.starts_with("cpu MHz") || l.starts_with("BogoMIPS") {
+                    if let Some(val_str) = l.split(':').nth(1) {
+                        if let Ok(val) = val_str.trim().parse::<f64>() { freqs.push(val); }
+                    }
+                }
+            }
+            if tx_cpu.send(Msg::CpuFreqs(freqs.clone())).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(cpu_interval));
         }
     }).unwrap();
@@ -539,8 +640,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::Builder::new().name("cg-mem".to_string()).spawn(move || {
         let mut mem_buf = String::with_capacity(2048);
         let mut swap_buf = String::with_capacity(2048);
+        let mut parsed_swaps = Vec::with_capacity(8);
+        let mut swap_devices_formatted = Vec::with_capacity(8);
+
         loop {
             mem_buf.clear();
+            swap_buf.clear();
+            parsed_swaps.clear();
+            swap_devices_formatted.clear();
+
             if let Ok(mut file) = File::open("/proc/meminfo") { let _ = file.read_to_string(&mut mem_buf); }
             let (mut total, mut avail) = (0u64, 0u64);
             for line in mem_buf.lines() {
@@ -551,7 +659,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 else if p[0] == "MemAvailable:" { avail = val; }
             }
            
-            // KB converted directly into Bytes to ensure strict 6-character UI scaling
+            // KB converted directly into Bytes to ensure strict UI scaling string boundaries
             let used_bytes = total.saturating_sub(avail) * 1024;
             let avail_bytes = avail * 1024;
             let total_bytes = total * 1024;
@@ -567,13 +675,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ram_str = format!("{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {col}\x1b[1m{}\x1b[0m {wb_avail_parent} | {cya}{}\x1b[0m {wb_total_parent}",
                 format_size(used_bytes), format_size(avail_bytes), format_size(total_bytes), col=mem_color, wb_used_parent=wb_used_parent, wb_avail_parent=wb_avail_parent, cya=cyan_bold);
 
-            swap_buf.clear();
             if let Ok(mut file) = File::open("/proc/swaps") { let _ = file.read_to_string(&mut swap_buf); }
             let mut total_swap = 0u64;
             let mut total_swap_used = 0u64;
-            let mut swap_devices_formatted = Vec::new();
            
-            let mut parsed_swaps = Vec::new();
             for line in swap_buf.lines().skip(1) {
                 let p: Vec<&str> = line.split_whitespace().collect();
                 if p.len() >= 4 {
@@ -589,11 +694,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Fixed width left strings mathematically ensures UI right alignment on `Total`.
             let max_swap_len = parsed_swaps.iter().map(|(n, _, _)| n.len()).max().unwrap_or(4);
            
-            for (name, used_bytes, size_bytes) in parsed_swaps {
-                let swap_percent = if size_bytes > 0 { used_bytes as f64 / size_bytes as f64 } else { 0.0 };
+            for (name, used_bytes, size_bytes) in &parsed_swaps {
+                let swap_percent = if *size_bytes > 0 { *used_bytes as f64 / *size_bytes as f64 } else { 0.0 };
                 let col = get_swap_color(swap_percent);
                 swap_devices_formatted.push(format!(" {:<width$}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
-                    name, format_size(used_bytes), format_size(size_bytes), col=col, width=max_swap_len));
+                    name, format_size(*used_bytes), format_size(*size_bytes), col=col, width=max_swap_len));
             }
 
             let total_swap_percent = if total_swap > 0 { total_swap_used as f64 / total_swap as f64 } else { 0.0 };
@@ -609,7 +714,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Y" => {
                             match (fs::read_to_string("/sys/kernel/debug/zswap/pool_total_size"), fs::read_to_string("/sys/kernel/debug/zswap/stored_pages")) {
                                 (Ok(p_str), Ok(pg_str)) => {
-                                    let pool_bytes = p_str.trim().parse::<u64>().unwrap_or(0); // This parameter uniquely outputs raw Bytes.
+                                    let pool_bytes = p_str.trim().parse::<u64>().unwrap_or(0);
                                     let pages = pg_str.trim().parse::<u64>().unwrap_or(0);
                                     let ratio = if pool_bytes > 0 { (pages * 4 * 1024) as f64 / (pool_bytes as f64) } else { 0.0 };
                                     let pool_color = if pool_bytes > 0 { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;150;150;150m" };
@@ -629,7 +734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            if tx_mem.send(Msg::MemStats { ram_str, zswap_str, swap_total_str, swaps_formatted: swap_devices_formatted }).is_err() { break; }
+            if tx_mem.send(Msg::MemStats { ram_str, zswap_str, swap_total_str, swaps_formatted: swap_devices_formatted.clone() }).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(mem_interval));
         }
     }).unwrap();
@@ -640,47 +745,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut prev_stats: HashMap<String, (u64, u64, Instant)> = HashMap::with_capacity(16);
         let mut current_stats = Vec::with_capacity(8);
         let mut current_keys = HashSet::with_capacity(8);
+        let mut dev_str = String::with_capacity(4096);
        
         loop {
             current_stats.clear();
             current_keys.clear();
+            dev_str.clear();
             let now = Instant::now();
 
-            if let Ok(dev_str) = fs::read_to_string("/proc/net/dev") {
-                for line in dev_str.lines().skip(2) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() < 17 { continue; }
-                    let iface = parts[0].trim_end_matches(':').to_string();
-                    if iface == "lo" { continue; }
+            if let Ok(mut file) = File::open("/proc/net/dev") { let _ = file.read_to_string(&mut dev_str); }
+            for line in dev_str.lines().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 17 { continue; }
+                let iface = parts[0].trim_end_matches(':').to_string();
+                if iface == "lo" { continue; }
 
-                    let rx = parts[1].parse::<u64>().unwrap_or(0);
-                    let tx = parts[9].parse::<u64>().unwrap_or(0);
-                    current_keys.insert(iface.clone());
+                let rx = parts[1].parse::<u64>().unwrap_or(0);
+                let tx = parts[9].parse::<u64>().unwrap_or(0);
+                current_keys.insert(iface.clone());
 
-                    let speed_mbps = fs::read_to_string(format!("/sys/class/net/{}/speed", iface)).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(1000.0);
-                    let max_bytes_per_sec = speed_mbps * 1_000_000.0 / 8.0;
+                let speed_mbps = fs::read_to_string(format!("/sys/class/net/{}/speed", iface)).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(1000.0);
+                let max_bytes_per_sec = speed_mbps * 1_000_000.0 / 8.0;
 
-                    let (rx_speed, tx_speed) = if let Some(&(prev_rx, prev_tx, prev_time)) = prev_stats.get(&iface) {
-                        let duration = now.duration_since(prev_time).as_secs_f64();
-                        if duration > 0.0 { (rx.saturating_sub(prev_rx) as f64 / duration, tx.saturating_sub(prev_tx) as f64 / duration) } else { (0.0, 0.0) }
-                    } else {
-                        let _ = tx_net.send(Msg::NetEvent(iface.clone(), "ACTIVATED".to_string()));
-                        (0.0, 0.0)
-                    };
+                let (rx_speed, tx_speed) = if let Some(&(prev_rx, prev_tx, prev_time)) = prev_stats.get(&iface) {
+                    let duration = now.duration_since(prev_time).as_secs_f64();
+                    if duration > 0.0 { (rx.saturating_sub(prev_rx) as f64 / duration, tx.saturating_sub(prev_tx) as f64 / duration) } else { (0.0, 0.0) }
+                } else {
+                    let _ = tx_net.send(Msg::NetEvent(iface.clone(), "ACTIVATED".to_string()));
+                    (0.0, 0.0)
+                };
 
-                    current_stats.push((iface.clone(), rx_speed, tx_speed, max_bytes_per_sec));
-                    prev_stats.insert(iface, (rx, tx, now));
-                }
+                current_stats.push((iface.clone(), rx_speed, tx_speed, max_bytes_per_sec));
+                prev_stats.insert(iface, (rx, tx, now));
             }
 
-            let mut to_remove = Vec::new();
-            for old_iface in prev_stats.keys() {
-                if !current_keys.contains(old_iface) {
-                    to_remove.push(old_iface.clone());
-                    let _ = tx_net.send(Msg::NetEvent(old_iface.clone(), "DEACTIVATED".to_string()));
-                }
-            }
-            for rm in to_remove { prev_stats.remove(&rm); }
+            // Zero Allocation Memory Sweep
+            prev_stats.retain(|k, _| {
+                let keep = current_keys.contains(k);
+                if !keep { let _ = tx_net.send(Msg::NetEvent(k.clone(), "DEACTIVATED".to_string())); }
+                keep
+            });
 
             if tx_net.send(Msg::NetStats(current_stats.clone())).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(net_interval));
@@ -697,60 +801,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }).unwrap();
 
     // --- Storage Telemetry Prototype Thread (v3.0.0) ---
-    // Architecture: Uses `libc::statvfs` via C-bindings to calculate partition space.
-    // Why libc over rustix?
-    // Using `rustix` would bloat the binary with several transitive dependencies (linux-raw-sys, bitflags) and massively increase compile times
-    // simply to make a single standard syscall. By cleanly wrapping `libc::statvfs` inside an unsafe block, CPU-Grid guarantees 0% CPU footprint
-    // without inflating memory RSS with bloated third-party dependencies, adhering to the "zero bloat" architectural mandate.
-    // Disk Throughput is handled in 100% safe, pure Rust via /proc/diskstats.
     let tx_disk = tx.clone();
     thread::Builder::new().name("cg-disk".to_string()).spawn(move || {
         let mut prev_disk_stats: HashMap<String, (u64, u64, Instant)> = HashMap::with_capacity(16);
         let allowed_fs: HashSet<&str> = ["ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "vfat", "exfat", "ntfs", "ntfs3", "f2fs"].into_iter().collect();
 
         // Hoisted allocations to protect background memory layout from heap fragmentation bloat over uptime.
-        let mut mount_caps: HashMap<u64, (u64, u64, String, String, String)> = HashMap::with_capacity(16); // K: f_fsid, V: (Total, Used, Mount, FS, Dev)
-        let mut dev_traffic: HashMap<String, (f64, f64)> = HashMap::with_capacity(16); // K: Device Name (e.g., sda), V: (Read Bytes/s, Write Bytes/s)
-        let mut formatted_disks = Vec::with_capacity(16);
-       
-        // Track the maximum theoretical disk speed observed dynamically throughout the process lifetime to normalize color interpolation perfectly.
-        // Base starting point assumes standard SATA SSD (500 MB/s). If an NVMe hits 3500 MB/s, it dynamically raises this ceiling.
-        let mut session_max_speed = 500_000_000.0_f64;
+        let mut mount_caps: HashMap<u64, (u64, u64, String, String, String)> = HashMap::with_capacity(16);
+        let mut dev_traffic: HashMap<String, (f64, f64)> = HashMap::with_capacity(16);
+        let mut disk_cap_nodes = Vec::with_capacity(16);
+        let mut disk_io_nodes = Vec::with_capacity(16);
+        let mut hw_trackers: HashMap<String, HrHwState> = HashMap::with_capacity(16);
+        let mut global_hw = HrHwState::new();
+        let mut active_devs = HashSet::with_capacity(16);
+
+        let mut mounts_str = String::with_capacity(4096);
+        let mut diskstats_str = String::with_capacity(8192);
 
         loop {
             mount_caps.clear();
             dev_traffic.clear();
-            formatted_disks.clear();
+            disk_cap_nodes.clear();
+            disk_io_nodes.clear();
+            active_devs.clear();
+            mounts_str.clear();
+            diskstats_str.clear();
 
             // 1. Gather Disk Capacities & Deduplicate Pools
-            if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
-                for line in mounts.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() < 6 { continue; }
-                    let dev = parts[0];
-                    let mount = parts[1];
-                    let fs_type = parts[2];
+            if let Ok(mut f) = File::open("/proc/mounts") { let _ = f.read_to_string(&mut mounts_str); }
+            for line in mounts_str.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 6 { continue; }
+                let dev = parts[0];
+                let mount = parts[1];
+                let fs_type = parts[2];
 
-                    if allowed_fs.contains(fs_type) {
-                        use std::ffi::CString;
-                        if let Ok(c_path) = CString::new(mount) {
-                            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-                            // FFI Call into libc to prevent shelling out to `df`.
-                            if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } == 0 {
-                                let total_bytes = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
-                                let free_bytes = (stat.f_bfree as u64).saturating_mul(stat.f_frsize as u64);
-                                let used_bytes = total_bytes.saturating_sub(free_bytes);
-                                let fsid = stat.f_fsid as u64;
+                if allowed_fs.contains(fs_type) {
+                    use std::ffi::CString;
+                    if let Ok(c_path) = CString::new(mount) {
+                        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+                        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } == 0 {
+                            let total_bytes = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
+                            let free_bytes = (stat.f_bfree as u64).saturating_mul(stat.f_frsize as u64);
+                            let used_bytes = total_bytes.saturating_sub(free_bytes);
+                            let fsid = stat.f_fsid as u64;
 
-                                // Deduplicate BTRFS/ZFS pools by merging mount points sharing identical filesystem IDs.
-                                // Keeps the shortest root mount path to prevent UI spam.
-                                if let Some(existing) = mount_caps.get_mut(&fsid) {
-                                    if mount.len() < existing.2.len() {
-                                        existing.2 = mount.to_string();
-                                    }
-                                } else {
-                                    mount_caps.insert(fsid, (total_bytes, used_bytes, mount.to_string(), fs_type.to_string(), dev.to_string()));
+                            if let Some(existing) = mount_caps.get_mut(&fsid) {
+                                if mount.len() < existing.2.len() {
+                                    existing.2 = mount.to_string();
                                 }
+                            } else {
+                                mount_caps.insert(fsid, (total_bytes, used_bytes, mount.to_string(), fs_type.to_string(), dev.to_string()));
                             }
                         }
                     }
@@ -759,27 +860,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 2. Gather Real-Time I/O Traffic natively via diskstats
             let now = Instant::now();
-            if let Ok(diskstats) = fs::read_to_string("/proc/diskstats") {
-                for line in diskstats.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 14 {
-                        let dev_name = parts[2];
-                        let sectors_read = parts[5].parse::<u64>().unwrap_or(0);
-                        let sectors_written = parts[9].parse::<u64>().unwrap_or(0);
-                       
-                        let bytes_read = sectors_read * 512;
-                        let bytes_written = sectors_written * 512;
+            if let Ok(mut f) = File::open("/proc/diskstats") { let _ = f.read_to_string(&mut diskstats_str); }
+            for line in diskstats_str.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 14 {
+                    let dev_name = parts[2];
+                    let sectors_read = parts[5].parse::<u64>().unwrap_or(0);
+                    let sectors_written = parts[9].parse::<u64>().unwrap_or(0);
+                   
+                    let bytes_read = sectors_read * 512;
+                    let bytes_written = sectors_written * 512;
 
-                        let (r_speed, w_speed) = if let Some(&(p_read, p_write, p_time)) = prev_disk_stats.get(dev_name) {
-                            let duration = now.duration_since(p_time).as_secs_f64();
-                            if duration > 0.0 {
-                                (bytes_read.saturating_sub(p_read) as f64 / duration, bytes_written.saturating_sub(p_write) as f64 / duration)
-                            } else { (0.0, 0.0) }
-                        } else { (0.0, 0.0) };
+                    let (r_speed, w_speed) = if let Some(&(p_read, p_write, p_time)) = prev_disk_stats.get(dev_name) {
+                        let duration = now.duration_since(p_time).as_secs_f64();
+                        if duration > 0.0 {
+                            (bytes_read.saturating_sub(p_read) as f64 / duration, bytes_written.saturating_sub(p_write) as f64 / duration)
+                        } else { (0.0, 0.0) }
+                    } else { (0.0, 0.0) };
 
-                        dev_traffic.insert(dev_name.to_string(), (r_speed, w_speed));
-                        prev_disk_stats.insert(dev_name.to_string(), (bytes_read, bytes_written, now));
-                    }
+                    dev_traffic.insert(dev_name.to_string(), (r_speed, w_speed));
+                    prev_disk_stats.insert(dev_name.to_string(), (bytes_read, bytes_written, now));
                 }
             }
 
@@ -793,61 +893,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut sorted_mounts: Vec<_> = mount_caps.values().collect();
             sorted_mounts.sort_by(|a, b| a.2.cmp(&b.2));
 
-            // Find longest path dynamically so we can mathematically left-pad to right-align the total values automatically in the UI.
-            let max_mount_len = sorted_mounts.iter().map(|(_, _, m, _, _)| m.chars().count()).max().unwrap_or(4);
+            let max_mount_len = sorted_mounts.iter().map(|t| t.2.chars().count()).max().unwrap_or(4);
 
-            for (total_bytes, used_bytes, mount, fs_type, dev) in sorted_mounts {
-                if *total_bytes == 0 { continue; }
-                agg_total += *total_bytes;
-                agg_used += *used_bytes;
+            // Explicit dereferencing of tuple values perfectly neutralizes match ergonomics pointer buildup (`E0614`)
+            for tuple in &sorted_mounts {
+                let total_bytes: u64 = (*tuple).0;
+                let used_bytes: u64 = (*tuple).1;
+                let mount: &String = &(*tuple).2;
+                let fs_type: &String = &(*tuple).3;
+                let dev: &String = &(*tuple).4;
 
-                // Strip down path (e.g. /dev/mapper/xxx) to pure device node name to match diskstats output.
+                if total_bytes == 0 { continue; }
+                agg_total += total_bytes;
+                agg_used += used_bytes;
+
                 let raw_dev_name = if let Ok(path) = fs::canonicalize(dev) {
                     path.file_name().unwrap_or_default().to_string_lossy().to_string()
                 } else {
                     dev.split('/').last().unwrap_or("").to_string()
                 };
 
+                active_devs.insert(raw_dev_name.clone());
+
                 let (r_speed, w_speed) = dev_traffic.get(&raw_dev_name).unwrap_or(&(0.0, 0.0));
                
-                // Track dynamic ceiling limits
-                if *r_speed > session_max_speed { session_max_speed = *r_speed; }
-                if *w_speed > session_max_speed { session_max_speed = *w_speed; }
+                let hw = hw_trackers.entry(raw_dev_name.clone()).or_insert_with(HrHwState::new);
+                hw.update(*r_speed, *w_speed);
 
-                agg_read_speed += r_speed;
-                agg_write_speed += w_speed;
+                agg_read_speed += *r_speed;
+                agg_write_speed += *w_speed;
 
-                let percent = *used_bytes as f64 / *total_bytes as f64;
+                let percent = used_bytes as f64 / total_bytes as f64;
                 let is_cow = fs_type.contains("btrfs") || fs_type.contains("zfs");
-                let color = get_disk_color(percent, is_cow);
+                let capacity_color = get_disk_capacity_color(percent, is_cow);
                 if percent >= (if is_cow { 0.85 } else { 0.95 }) { force_violet_parent = true; }
 
-                // Emulates 2-col UI: Left side receives Capacity string, Right side receives Speed string.
-                // Left justifies Mount to exact variable width, enforcing identical text lengths, pushing "Total" uniformly away from `|`
-                formatted_disks.push(format!(" {:<width$}: {color}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
-                    mount, format_size(*used_bytes), format_size(*total_bytes), color=color, width=max_mount_len
+                disk_cap_nodes.push(format!(" {:<width$}: {color}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
+                    mount, format_size(used_bytes), format_size(total_bytes), color=capacity_color, width=max_mount_len
                 ));
-                // Read = Disk to Memory (UP), Write = Memory to Disk (DOWN)
-                formatted_disks.push(format!("{}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m",
-                    get_net_color(*r_speed, session_max_speed), format_net_speed(*r_speed),
-                    get_net_color(*w_speed, session_max_speed), format_net_speed(*w_speed),
+
+                let r_color = get_exp_disk_speed_color(*r_speed, hw.current_r);
+                let w_color = get_exp_disk_speed_color(*w_speed, hw.current_w);
+               
+                let hr_col = if hw.current_r > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+                let hw_col = if hw.current_w > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+
+                disk_io_nodes.push(format!("{}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m  {hr_col}HR:\x1b[0m{}  {hw_col}HW:\x1b[0m{}",
+                    r_color, format_disk_speed(*r_speed),
+                    w_color, format_disk_speed(*w_speed),
+                    format_disk_speed(hw.current_r),
+                    format_disk_speed(hw.current_w)
                 ));
             }
 
             let agg_percent = if agg_total > 0 { agg_used as f64 / agg_total as f64 } else { 0.0 };
-            let mut parent_color = get_disk_color(agg_percent, false);
+            let mut parent_color = get_disk_capacity_color(agg_percent, false);
             if force_violet_parent { parent_color = "\x1b[1;38;2;238;130;238m".to_string(); }
            
-            let disk_total_str = format!(
-                "\x1b[1mStorage Total:\x1b[0m {p_col}\x1b[1m{}\x1b[0m \x1b[1;37mUsed\x1b[0m | \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[1;37mTotal\x1b[0m | {p_col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m | {}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m",
+            global_hw.update(agg_read_speed, agg_write_speed);
+            let r_parent_color = get_exp_disk_speed_color(agg_read_speed, global_hw.current_r);
+            let w_parent_color = get_exp_disk_speed_color(agg_write_speed, global_hw.current_w);
+            let hr_p_col = if global_hw.current_r > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+            let hw_p_col = if global_hw.current_w > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+
+            let disk_cap_parent = format!(
+                "\x1b[1mStorage Space Total:\x1b[0m {p_col}\x1b[1m{}\x1b[0m \x1b[1;37mUsed\x1b[0m | \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[1;37mTotal\x1b[0m | {p_col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
+                format_size(agg_used), format_size(agg_total), agg_percent * 100.0, p_col=parent_color
+            );
+
+            let disk_io_parent = format!(
+                "\x1b[1mStorage \x1b[1m↓↑\x1b[0m \x1b[1mTotal:\x1b[0m {}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m  {hr_p_col}HR:\x1b[0m{}  {hw_p_col}HW:\x1b[0m{}",
+                r_parent_color, format_disk_speed(agg_read_speed),
+                w_parent_color, format_disk_speed(agg_write_speed),
+                format_disk_speed(global_hw.current_r),
+                format_disk_speed(global_hw.current_w)
+            );
+
+            let disk_combined_parent = format!(
+                "\x1b[1mStorage Total:\x1b[0m {p_col}\x1b[1m{}\x1b[0m \x1b[1;37mUsed\x1b[0m | \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[1;37mTotal\x1b[0m | {p_col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m | {}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m  {hr_p_col}HR:\x1b[0m{}  {hw_p_col}HW:\x1b[0m{}",
                 format_size(agg_used), format_size(agg_total), agg_percent * 100.0,
-                get_net_color(agg_read_speed, session_max_speed), format_net_speed(agg_read_speed),
-                get_net_color(agg_write_speed, session_max_speed), format_net_speed(agg_write_speed),
+                r_parent_color, format_disk_speed(agg_read_speed),
+                w_parent_color, format_disk_speed(agg_write_speed),
+                format_disk_speed(global_hw.current_r),
+                format_disk_speed(global_hw.current_w),
                 p_col=parent_color
             );
 
-            if tx_disk.send(Msg::DiskStats { disk_total_str, disks_formatted: formatted_disks.clone() }).is_err() { break; }
-            thread::sleep(Duration::from_secs_f64(mem_interval));
+            prev_disk_stats.retain(|k, _| active_devs.contains(k));
+            hw_trackers.retain(|k, _| active_devs.contains(k));
+
+            if tx_disk.send(Msg::DiskStats {
+                disk_cap_parent, disk_io_parent, disk_combined_parent,
+                disk_cap_nodes: disk_cap_nodes.clone(), disk_io_nodes: disk_io_nodes.clone()
+            }).is_err() { break; }
+            thread::sleep(Duration::from_secs_f64(disk_interval));
         }
     }).unwrap();
 
@@ -870,8 +1009,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_total_str: "Loading...".into(),
         net_stats: vec![],
         net_events: HashMap::new(),
-        disk_total_str: "Loading...".into(),
-        disks_formatted: vec![],
+        disk_cap_parent: "Loading...".into(),
+        disk_io_parent: "Loading...".into(),
+        disk_combined_parent: "Loading...".into(),
+        disk_cap_nodes: vec![],
+        disk_io_nodes: vec![],
         idle_time: Duration::ZERO,
     };
 
@@ -935,9 +1077,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Net Total", total_rx_col, format_net_speed(total_rx), total_tx_col, format_net_speed(total_tx), width=align_len);
                     state.net_stats = net_nodes;
                 },
-                Msg::DiskStats { disk_total_str, disks_formatted } => {
-                    state.disk_total_str = disk_total_str;
-                    state.disks_formatted = disks_formatted;
+                Msg::DiskStats { disk_cap_parent, disk_io_parent, disk_combined_parent, disk_cap_nodes, disk_io_nodes } => {
+                    state.disk_cap_parent = disk_cap_parent;
+                    state.disk_io_parent = disk_io_parent;
+                    state.disk_combined_parent = disk_combined_parent;
+                    state.disk_cap_nodes = disk_cap_nodes;
+                    state.disk_io_nodes = disk_io_nodes;
                 },
                 Msg::NetEvent(iface, event_str) => { state.net_events.insert(iface, (event_str, Instant::now())); },
                 Msg::UserIdle(d) => state.idle_time = d,
@@ -968,7 +1113,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
-        // Standardized 2-Column Grid Renderer logic updated cleanly.
         let print_aligned_2col_grid = |row: &mut u16, items: &[String], max_w: usize, stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
             let mut col1_w = 0;
             let mut check_idx = 0;
@@ -1023,7 +1167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // --- Render Temperatures Heat-Map ---
-        if row < max_h - 1 {
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mTemperature Heat-Map\x1b[0m"))?;
@@ -1042,7 +1186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let max_lbl = chiplets.iter().map(|c| c.label.len()).max().unwrap_or(4).max(4);
 
             for r in 0..temp_rows {
-                if row >= max_h - 1 { break; }
+                if row >= max_h { break; }
                 stdout.queue(cursor::MoveTo(0, row))?;
                 stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
                 for c in 0..cols {
@@ -1063,7 +1207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                        else if is_vm { "VM Guest Detected" }
                        else { "Core Heat-Map" };
 
-        if row < max_h - 1 {
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, &format!("\x1b[1;38;2;255;215;0m{}\x1b[0m", core_msg)))?;
@@ -1074,7 +1218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cpu_rows = (state.freqs.len() + cols - 1) / cols;
 
         for r in 0..cpu_rows {
-            if row >= max_h - 1 { break; }
+            if row >= max_h { break; }
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             for c in 0..cols {
@@ -1093,7 +1237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // --- Render Memory Heat-Map ---
-        if row < max_h - 1 {
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mMemory Heat-Map\x1b[0m"))?;
@@ -1106,7 +1250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_aligned_2col_grid(&mut row, &state.swaps_formatted, max_w as usize, &mut stdout)?;
 
         // --- Render Network Heat-Map ---
-        if row < max_h - 1 {
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mNetwork Heat-Map\x1b[0m"))?;
@@ -1116,24 +1260,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_line(&mut row, &state.net_total_str, &mut stdout)?;
         print_aligned_2col_grid(&mut row, &state.net_stats, max_w as usize, &mut stdout)?;
 
-        // --- Render Storage Telemetry ---
-        if row < max_h - 1 {
-            stdout.queue(cursor::MoveTo(0, row))?;
-            stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mStorage Heat-Map\x1b[0m"))?;
-            row += 1;
+        // --- Render Storage Telemetry (Dynamic Split) ---
+        let max_cap_len = state.disk_cap_nodes.iter().map(|s| strip_ansi(s)).max().unwrap_or(0);
+        let max_io_len = state.disk_io_nodes.iter().map(|s| strip_ansi(s)).max().unwrap_or(0);
+
+        if max_cap_len + 3 + max_io_len <= max_w as usize {
+            if row < max_h {
+                stdout.queue(cursor::MoveTo(0, row))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mStorage Heat-Map\x1b[0m"))?;
+                row += 1;
+            }
+            print_line(&mut row, &state.disk_combined_parent, &mut stdout)?;
+            let mut combined = Vec::with_capacity(state.disk_cap_nodes.len());
+            for i in 0..state.disk_cap_nodes.len() {
+                let cap = &state.disk_cap_nodes[i];
+                let io = &state.disk_io_nodes[i];
+                let pad = " ".repeat(max_cap_len.saturating_sub(strip_ansi(cap)));
+                combined.push(format!("{}{} | {}", cap, pad, io));
+            }
+            print_aligned_2col_grid(&mut row, &combined, max_w as usize, &mut stdout)?;
+        } else {
+            if row < max_h {
+                stdout.queue(cursor::MoveTo(0, row))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mStorage Space Heat-Map\x1b[0m"))?;
+                row += 1;
+            }
+            print_line(&mut row, &state.disk_cap_parent, &mut stdout)?;
+            print_aligned_2col_grid(&mut row, &state.disk_cap_nodes, max_w as usize, &mut stdout)?;
+
+            if row < max_h {
+                stdout.queue(cursor::MoveTo(0, row))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mStorage \x1b[1m↓↑\x1b[0m \x1b[1;38;2;255;215;0mHeat-Map\x1b[0m"))?;
+                row += 1;
+            }
+            print_line(&mut row, &state.disk_io_parent, &mut stdout)?;
+            print_aligned_2col_grid(&mut row, &state.disk_io_nodes, max_w as usize, &mut stdout)?;
         }
 
-        print_line(&mut row, &state.disk_total_str, &mut stdout)?;
-        print_aligned_2col_grid(&mut row, &state.disks_formatted, max_w as usize, &mut stdout)?;
-
-        if row < max_h - 1 {
+        // Draw the very last horizontal border precisely at `max_h - 1` without executing ClearType::UntilNewLine.
+        // Also subtract 1 from max_w specifically for the last line to prevent the terminal from automatically
+        // shifting the buffer down and spawning an invisible row when the cursor hits the absolute bottom-right cell.
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
-            stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", "-".repeat(max_w as usize))?;
+            if row == max_h - 1 {
+                write!(stdout, "{}", "-".repeat((max_w as usize).saturating_sub(1)))?;
+            } else {
+                write!(stdout, "{}", "-".repeat(max_w as usize))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+            }
+            row += 1; // ensure row correctly tracks location
         }
 
-        stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
+        // Safely wipe out any old terminal garbage from resizing ONLY on lines strictly beneath the actual rendered content
+        if row < max_h {
+            stdout.queue(cursor::MoveTo(0, row))?;
+            stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
+        }
+
         stdout.flush()?;
         thread::sleep(Duration::from_millis(50));
     }
