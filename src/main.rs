@@ -29,18 +29,60 @@ struct TempStat {
     is_parent: bool,
 }
 
+// Persistently tracks High Watermark historical peaks. Delay prevents UI color flickering on bursts.
+struct HrHwState {
+    current_r: f64,
+    pending_r: f64,
+    pending_time_r: Instant,
+    current_w: f64,
+    pending_w: f64,
+    pending_time_w: Instant,
+}
+
+impl HrHwState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self { current_r: 0.0, pending_r: 0.0, pending_time_r: now, current_w: 0.0, pending_w: 0.0, pending_time_w: now }
+    }
+    fn update(&mut self, r: f64, w: f64) {
+        if r > self.pending_r {
+            self.pending_r = r;
+            self.pending_time_r = Instant::now();
+        }
+        // Absolute max logic: once current_r/w is established, it strictly holds the highest recorded value
+        if self.pending_r > self.current_r && self.pending_time_r.elapsed().as_secs_f64() >= 1.5 {
+            self.current_r = self.pending_r;
+        }
+
+        if w > self.pending_w {
+            self.pending_w = w;
+            self.pending_time_w = Instant::now();
+        }
+        if self.pending_w > self.current_w && self.pending_time_w.elapsed().as_secs_f64() >= 1.5 {
+            self.current_w = self.pending_w;
+        }
+    }
+}
+
 enum Msg {
     CpuFreqs(Vec<f64>),
-    CpuTemps(Vec<(String, Vec<TempStat>)>), // Parent CPU/Adapter, Vec of Chiplet data
+    CpuTemps(Vec<(String, Vec<TempStat>)>),
     RoomTemp(String),
     MemStats {
         ram_str: String,
         zswap_str: String,
         swap_total_str: String,
-        swaps_formatted: Vec<String>, // Formatted in background thread to prevent UI heap fragmentation
+        swaps_formatted: Vec<String>,
     },
-    NetStats(Vec<(String, f64, f64, f64)>), // Interface, Rx Speed, Tx Speed, Max Speed
-    NetEvent(String, String),               // Interface Name, Event String (ACTIVATED/DEACTIVATED)
+    NetStats(Vec<(String, f64, f64, f64)>),
+    NetEvent(String, String),              
+    DiskStats {
+        disk_cap_parent: String,
+        disk_io_parent: String,
+        disk_combined_parent: String,
+        disk_cap_nodes: Vec<String>,
+        disk_io_nodes: Vec<String>,
+    },
     UserIdle(Duration),
 }
 
@@ -57,6 +99,11 @@ struct SystemState {
     net_total_str: String,
     net_stats: Vec<String>,
     net_events: HashMap<String, (String, Instant)>,
+    disk_cap_parent: String,
+    disk_io_parent: String,
+    disk_combined_parent: String,
+    disk_cap_nodes: Vec<String>,
+    disk_io_nodes: Vec<String>,
     idle_time: Duration,
 }
 
@@ -80,10 +127,13 @@ fn print_help() {
     println!("Compatibility: Full support for x86, ARM (incl. Apple Silicon), RISC-V, and IBM processor architectures via standard Linux kernel sysfs interfaces.");
 
     println!("\nUsage (Values are in seconds. Parameters given less than or greater than the boundary ranges will fall back to the nearest boundary range.):");
-    println!("  -n[<secs>]    Interval for CPU stats (0.1 - 60s, default 2.0)");
-    println!("  -r[<secs>]    Interval for Room Temp (1 - 3600s, default 2.0)");
-    println!("  -m[<secs>]    Interval for Memory stats (0.5 - 60s, default 2.0)");
-    println!("  -t[<secs>]    Interval for Network traffic (0.5 - 60s, default 2.0)");
+    println!("  -n, --cpu-stats-interval <secs>    Interval for CPU stats (0.1 - 60s, default 2.0)");
+    println!("  -r, --room-temp-interval <secs>    Interval for Room Temp (1 - 3600s, default 2.0)");
+    println!("  -m, --mem-stats-interval <secs>    Interval for Memory stats (0.5 - 60s, default 2.0)");
+    println!("  -t, --net-interval <secs>          Interval for Network traffic (0.5 - 60s, default 2.0)");
+    println!("  -d, --disk-interval <secs>         Interval for Storage telemetry (0.5 - 60s, default 2.0)");
+    println!("  -h, --help                         Prints this help document");
+    println!("  -v, --version                      Prints version and copyright");
 
     println!("\nTips:");
     println!("  If running with {red}sudo{rst} and Room Temp fails, use '{red}sudo -E{rst}' to preserve your user environment.");
@@ -91,11 +141,12 @@ fn print_help() {
     println!("\nColor Legend (Color shade gradually changes between the ranges defined underneath):");
     println!("  CPU Freq:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-100%) -> {vio}Violet{rst}(>100% overclock)");
     println!("  RAM Load:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-95%) -> {vio}Violet{rst}(>=95%)");
-    println!("                  (Used and Available values share the same color to indicate total memory pressure)");
     println!("  Swap Load:      {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-80%) -> {red}Hot Red{rst}(80-90%) -> {vio}Violet{rst}(>=90%)");
     println!("  Network Load:   {grn}Green{rst}(Low) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Hot Red{rst}(Near Interface Max) -> {vio}Violet{rst}(Exceeds Theoretical)");
+    println!("  Storage Space:  {grn}Green{rst}(0-75%) -> {yel}Yellow{rst}(75-85%) -> {org}Orange{rst}(85-90%) -> {red}Hot Red{rst}(90-95%) -> {vio}Violet{rst}(>=95%)");
+    println!("                  (Note: BTRFS/ZFS limits scale earlier to account for Copy-on-Write fragmentation degradation)");
+    println!("  Storage \x1b[1m↓↑\x1b[0m:     {grn}Green{rst}(Baseline) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Hot Red{rst}(Highest Known HW/HR) -> {vio}Violet{rst}(Spiking to New Max)");
     println!("  CPU Temp:       {grn}Green{rst} (Cool) -> {red}Red{rst} (Thermal Throttle Limit) -> {vio}Violet{rst} (Exceeds Limit)");
-    println!("                  (Note: {red}Red{rst}/{vio}Violet{rst} limit is dynamic, set by your specific CPU hardware)");
     println!("  Room Temp:      {grn}Green{rst} (<=24) -> {yel}Yellow{rst}(27) -> {org}Orange{rst}(31) -> {ltr}LtRed{rst}(35) -> {vio}Violet{rst}(>=40)");
     println!("  Zswap Status:   {grn}Green{rst} (Enabled) -> {brt}Bright Red{rst} (Disabled) -> {yel}Yellow{rst} (Unknown Status) -> {vio}Violet{rst} (Not Present)");
     println!("  Zswap Algo:     {grn}zstd{rst} (Best) -> {yel}lz4{rst} -> {org}lzo{rst} -> {red}deflate{rst} -> {vio}Other{rst}");
@@ -107,38 +158,64 @@ fn strip_ansi(s: &str) -> usize {
     let mut len = 0;
     let mut in_ansi = false;
     for c in s.chars() {
-        if c == '\x1b' {
-            in_ansi = true;
-        } else if in_ansi && c == 'm' {
-            in_ansi = false;
-        } else if !in_ansi {
-            len += 1;
-        }
+        if c == '\x1b' { in_ansi = true; }
+        else if in_ansi && c == 'm' { in_ansi = false; }
+        else if !in_ansi { len += 1; }
     }
     len
 }
 
-fn format_size(kb: u64) -> String {
-    if kb < 1024 {
-        format!("{} KB", kb)
-    } else if kb < 1024 * 1024 {
-        format!("{:.1} MB", kb as f64 / 1024.0)
-    } else {
-        format!("{:.2} GB", kb as f64 / (1024.0 * 1024.0))
-    }
+// Strictly accepts Bytes and enforces a flawless 10-character width exactly aligned (e.g. `  12.3  GB`)
+fn format_size(bytes: u64) -> String {
+    let kb = 1024_f64;
+    let mb = kb * 1024.0;
+    let gb = mb * 1024.0;
+    let tb = gb * 1024.0;
+    let pb = tb * 1024.0;
+    let val = bytes as f64;
+
+    let (v, u) = if val < kb { (val, " B") }
+    else if val < mb { (val / kb, "KB") }
+    else if val < gb { (val / mb, "MB") }
+    else if val < tb { (val / gb, "GB") }
+    else if val < pb { (val / tb, "TB") }
+    else { (val / pb, "PB") };
+
+    if v >= 1000.0 { format!("{:6.0} {}", v, u) }
+    else { format!("{:6.1} {}", v, u) }
 }
 
-// Ensures all speed strings are exactly 11 characters long for perfect arrow vertical alignment
+// Limits standard network bandwidth output to strict characters for vertical alignment
 fn format_net_speed(bytes_per_sec: f64) -> String {
-    if bytes_per_sec < 1024.0 {
-        format!("{:6.1}  B/s", bytes_per_sec) // Extra space injected to match 5-char width of " KB/s"
-    } else if bytes_per_sec < 1024.0 * 1024.0 {
-        format!("{:6.1} KB/s", bytes_per_sec / 1024.0)
-    } else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 {
-        format!("{:6.1} MB/s", bytes_per_sec / (1024.0 * 1024.0))
-    } else {
-        format!("{:6.2} GB/s", bytes_per_sec / (1024.0 * 1024.0 * 1024.0))
-    }
+    let kb = 1024_f64;
+    let mb = kb * 1024.0;
+    let gb = mb * 1024.0;
+    let tb = gb * 1024.0;
+   
+    if bytes_per_sec < kb { format!("{:6.1}   B/s", bytes_per_sec) }
+    else if bytes_per_sec < mb { format!("{:6.1}  KB/s", bytes_per_sec / kb) }
+    else if bytes_per_sec < gb { format!("{:6.1}  MB/s", bytes_per_sec / mb) }
+    else if bytes_per_sec < tb { format!("{:6.2}  GB/s", bytes_per_sec / gb) }
+    else { format!("{:6.2}  TB/s", bytes_per_sec / tb) }
+}
+
+// Drops precision to .1 universally to save terminal real estate purely for the disk grids, yielding exact 9 chars
+fn format_disk_speed(bytes_per_sec: f64) -> String {
+    let kb = 1024_f64;
+    let mb = kb * 1024.0;
+    let gb = mb * 1024.0;
+    let tb = gb * 1024.0;
+    let pb = tb * 1024.0;
+
+    let (v, u) = if bytes_per_sec < kb { (bytes_per_sec, "B/s") }
+    else if bytes_per_sec < mb { (bytes_per_sec / kb, "K/s") }
+    else if bytes_per_sec < gb { (bytes_per_sec / mb, "M/s") }
+    else if bytes_per_sec < tb { (bytes_per_sec / gb, "G/s") }
+    else if bytes_per_sec < pb { (bytes_per_sec / tb, "T/s") }
+    else { (bytes_per_sec / pb, "P/s") };
+
+    if v >= 1000.0 { format!("{:5.0} {}", v, u) }
+    else { format!("{:5.1} {}", v, u) }
 }
 
 fn format_idle_time(secs: u64) -> String {
@@ -149,19 +226,12 @@ fn format_idle_time(secs: u64) -> String {
     let m = (secs % 3600) / 60;
     let s = secs % 60;
 
-    if y > 0 {
-        format!("{} Years {} Months {} Days {:02}:{:02}:{:02}", y, mon, d, h, m, s)
-    } else if mon > 0 {
-        format!("{} Months {} Days {:02}:{:02}:{:02}", mon, d, h, m, s)
-    } else if d > 0 {
-        format!("{} Days {:02}:{:02}:{:02}", d, h, m, s)
-    } else if h > 0 {
-        format!("{:02}:{:02}:{:02}", h, m, s)
-    } else if m > 0 {
-        format!("{:02}:{:02}", m, s)
-    } else {
-        format!("{}s", s)
-    }
+    if y > 0 { format!("{} Years {} Months {} Days {:02}:{:02}:{:02}", y, mon, d, h, m, s) }
+    else if mon > 0 { format!("{} Months {} Days {:02}:{:02}:{:02}", mon, d, h, m, s) }
+    else if d > 0 { format!("{} Days {:02}:{:02}:{:02}", d, h, m, s) }
+    else if h > 0 { format!("{:02}:{:02}:{:02}", h, m, s) }
+    else if m > 0 { format!("{:02}:{:02}", m, s) }
+    else { format!("{}s", s) }
 }
 
 // [SIMD Optimization]: #[inline(always)] forces this heavily utilized math function
@@ -182,12 +252,8 @@ fn format_dynamic_6(val: f64) -> String {
     let int_part = val.trunc();
     let int_len = if int_part == 0.0 { 1 } else { int_part.abs().log10().floor() as i32 + 1 };
    
-    if int_len >= 6 {
-        format!("{:6.0}", val.clamp(0.0, 999999.0))
-    } else {
-        let prec = (6 - int_len - 1).max(0) as usize;
-        format!("{:.*}", prec, val)
-    }
+    if int_len >= 6 { format!("{:6.0}", val.clamp(0.0, 999999.0)) }
+    else { let prec = (6 - int_len - 1).max(0) as usize; format!("{:.*}", prec, val) }
 }
 
 #[inline]
@@ -230,6 +296,41 @@ fn get_swap_color(t: f64) -> String {
 }
 
 #[inline]
+fn get_disk_capacity_color(percent: f64, is_cow: bool) -> String {
+    let (t_green, t_yellow, t_orange, t_red) = if is_cow {
+        (0.70, 0.80, 0.90, 0.95) // Adjusted COW threshold to keep 50%+ safe and green
+    } else {
+        (0.80, 0.90, 0.95, 0.98) // Standard formats like Ext4/XFS
+    };
+
+    if percent >= t_red { return "\x1b[1;38;2;238;130;238m".to_string(); } // Violet
+    let t = percent.clamp(0.0, 1.0);
+   
+    let (r, g, b) = if t <= t_green { (0, 200, 0) }
+    else if t <= t_yellow { lerp_color((0, 200, 0), (255, 255, 0), (t - t_green) / (t_yellow - t_green)) }
+    else if t <= t_orange { lerp_color((255, 255, 0), (255, 165, 0), (t - t_yellow) / (t_orange - t_yellow)) }
+    else { lerp_color((255, 165, 0), (255, 0, 0), (t - t_orange) / (t_red - t_orange)) };
+   
+    if t >= t_orange { format!("\x1b[1;38;2;{};{};{}m", r, g, b) }
+    else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
+}
+
+#[inline]
+fn get_exp_disk_speed_color(speed: f64, current_hw: f64) -> String {
+    if speed > current_hw && current_hw > 1024.0 { return "\x1b[1;38;2;238;130;238m".to_string(); }
+    if speed >= current_hw * 0.98 && current_hw > 1024.0 { return "\x1b[1;31m".to_string(); }
+   
+    // Exponential lerp via powf(3.0) allows colors to naturally hold greener ranges significantly longer before exploding toward warm colors at peak speeds.
+    let t = if current_hw > 0.0 { (speed / current_hw).clamp(0.0, 1.0).powf(3.0) } else { 0.0 };
+   
+    let (r, g, b) = if t <= 0.4 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.4) }
+    else if t <= 0.8 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.4) / 0.4) }
+    else { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.8) / 0.2) };
+   
+    format!("\x1b[38;2;{};{};{}m", r, g, b)
+}
+
+#[inline]
 fn get_net_color(speed: f64, max_speed: f64) -> String {
     let t = speed / max_speed.max(1.0);
     if t > 1.0 { return "\x1b[1;38;2;238;130;238m".to_string(); }
@@ -247,49 +348,31 @@ fn get_net_color(speed: f64, max_speed: f64) -> String {
 fn get_idle_color(secs: u64) -> String {
     let t = secs as f64 / 31536000.0;
     let t = t.clamp(0.0, 1.0);
-    let (r, g, b) = if t <= 0.25 {
-        lerp_color((0, 200, 0), (255, 255, 0), t / 0.25)
-    } else if t <= 0.5 {
-        lerp_color((255, 255, 0), (255, 165, 0), (t - 0.25) / 0.25)
-    } else if t <= 0.75 {
-        lerp_color((255, 165, 0), (255, 0, 0), (t - 0.5) / 0.25)
-    } else {
-        lerp_color((255, 0, 0), (238, 130, 238), (t - 0.75) / 0.25)
-    };
+    let (r, g, b) = if t <= 0.25 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.25) }
+    else if t <= 0.5 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.25) / 0.25) }
+    else if t <= 0.75 { lerp_color((255, 165, 0), (255, 0, 0), (t - 0.5) / 0.25) }
+    else { lerp_color((255, 0, 0), (238, 130, 238), (t - 0.75) / 0.25) };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
 #[inline]
 fn get_room_temp_color(temp: f64) -> String {
-    let (r, g, b) = if temp <= 24.0 {
-        (0, 200, 0)
-    } else if temp <= 27.0 {
-        lerp_color((0, 200, 0), (255, 255, 0), (temp - 24.0) / 3.0)
-    } else if temp <= 31.0 {
-        lerp_color((255, 255, 0), (255, 165, 0), (temp - 27.0) / 4.0)
-    } else if temp <= 35.0 {
-        lerp_color((255, 165, 0), (255, 100, 100), (temp - 31.0) / 4.0)
-    } else if temp < 40.0 {
-        lerp_color((255, 100, 100), (238, 130, 238), (temp - 35.0) / 5.0)
-    } else {
-        (238, 130, 238)
-    };
+    let (r, g, b) = if temp <= 24.0 { (0, 200, 0) }
+    else if temp <= 27.0 { lerp_color((0, 200, 0), (255, 255, 0), (temp - 24.0) / 3.0) }
+    else if temp <= 31.0 { lerp_color((255, 255, 0), (255, 165, 0), (temp - 27.0) / 4.0) }
+    else if temp <= 35.0 { lerp_color((255, 165, 0), (255, 100, 100), (temp - 31.0) / 4.0) }
+    else if temp < 40.0 { lerp_color((255, 100, 100), (238, 130, 238), (temp - 35.0) / 5.0) }
+    else { (238, 130, 238) };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
 #[inline]
 fn get_ratio_color(ratio: f64) -> String {
-    let (r, g, b) = if ratio < 1.0 {
-        (238, 130, 238)
-    } else if ratio <= 1.5 {
-        lerp_color((255, 50, 0), (255, 165, 0), (ratio - 1.0) / 0.5)
-    } else if ratio <= 2.5 {
-        lerp_color((255, 165, 0), (255, 255, 0), (ratio - 1.5) / 1.0)
-    } else if ratio <= 4.0 {
-        lerp_color((255, 255, 0), (0, 200, 0), (ratio - 2.5) / 1.5)
-    } else {
-        (0, 200, 0)
-    };
+    let (r, g, b) = if ratio < 1.0 { (238, 130, 238) }
+    else if ratio <= 1.5 { lerp_color((255, 50, 0), (255, 165, 0), (ratio - 1.0) / 0.5) }
+    else if ratio <= 2.5 { lerp_color((255, 165, 0), (255, 255, 0), (ratio - 1.5) / 1.0) }
+    else if ratio <= 4.0 { lerp_color((255, 255, 0), (0, 200, 0), (ratio - 2.5) / 1.5) }
+    else { (0, 200, 0) };
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
@@ -308,15 +391,11 @@ fn get_zswap_algo_color(algo: &str) -> String {
 
 fn is_virtual_machine() -> bool {
     if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
-        if cpuinfo.lines().any(|l| l.starts_with("flags") && l.contains("hypervisor")) {
-            return true;
-        }
+        if cpuinfo.lines().any(|l| l.starts_with("flags") && l.contains("hypervisor")) { return true; }
     }
     if let Ok(prod) = fs::read_to_string("/sys/class/dmi/id/product_name") {
         let p = prod.to_lowercase();
-        if p.contains("virtualbox") || p.contains("vmware") || p.contains("kvm") || p.contains("qemu") {
-            return true;
-        }
+        if p.contains("virtualbox") || p.contains("vmware") || p.contains("kvm") || p.contains("qemu") { return true; }
     }
     false
 }
@@ -328,18 +407,15 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<TempStat>)> {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = fs::read_to_string(path.join("name")).unwrap_or_default();
-            if !name.trim().contains("k10temp") && !name.trim().contains("coretemp") {
-                continue;
-            }
+            if !name.trim().contains("k10temp") && !name.trim().contains("coretemp") { continue; }
 
             let parent_name = name.trim().to_string();
-            let mut chiplet_parts = Vec::new();
+            let mut chiplet_parts = Vec::with_capacity(16);
 
             for file in fs::read_dir(&path).into_iter().flatten().flatten() {
                 let fname = file.file_name().to_string_lossy().into_owned();
-                if !fname.starts_with("temp") || !fname.ends_with("_input") {
-                    continue;
-                }
+                if !fname.starts_with("temp") || !fname.ends_with("_input") { continue; }
+               
                 let input_val = fs::read_to_string(file.path())
                     .ok()
                     .and_then(|s| s.trim().parse::<f64>().ok())
@@ -370,38 +446,25 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<TempStat>)> {
             }
 
             if !chiplet_parts.is_empty() {
-                chiplet_parts.sort_by(|a, b| {
-                    b.is_parent.cmp(&a.is_parent).then(a.label.cmp(&b.label))
-                });
-
+                chiplet_parts.sort_by(|a, b| { b.is_parent.cmp(&a.is_parent).then(a.label.cmp(&b.label)) });
                 cpu_groups.insert(parent_name, chiplet_parts);
             }
         }
     }
 
     if cpu_groups.is_empty() {
-        let default_val = if is_vm {
-            TempStat { label: "VM".to_string(), val: 0.0, color: "\x1b[38;2;255;165;0m".to_string(), is_parent: true }
-        } else {
-            TempStat { label: "N/A".to_string(), val: 0.0, color: "\x1b[38;2;255;0;0m".to_string(), is_parent: true }
-        };
+        let default_val = if is_vm { TempStat { label: "VM".to_string(), val: 0.0, color: "\x1b[38;2;255;165;0m".to_string(), is_parent: true } }
+                          else { TempStat { label: "N/A".to_string(), val: 0.0, color: "\x1b[38;2;255;0;0m".to_string(), is_parent: true } };
         vec![("CPU Temps".to_string(), vec![default_val])]
-    } else {
-        cpu_groups.into_iter().collect()
-    }
+    } else { cpu_groups.into_iter().collect() }
 }
 
 fn get_dashed_line(max_w: usize, mid_text: &str) -> String {
     let padding = " ";
     let content_len = strip_ansi(mid_text) + padding.len() * 2;
-
-    if content_len >= max_w {
-        return "-".repeat(max_w);
-    }
-
+    if content_len >= max_w { return "-".repeat(max_w); }
     let left_dashes = (max_w - content_len) / 2;
     let right_dashes = max_w - content_len - left_dashes;
-
     format!("{}{}{}{}{}", "-".repeat(left_dashes), padding, mid_text, padding, "-".repeat(right_dashes))
 }
 
@@ -413,15 +476,9 @@ fn find_temper_poll() -> Option<std::path::PathBuf> {
         std::path::PathBuf::from("/bin/temper-poll"),
         std::path::PathBuf::from("/opt/bin/temper-poll"),
     ];
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        candidates.push(std::path::PathBuf::from(format!("/home/{}/.local/bin/temper-poll", sudo_user)));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(std::path::PathBuf::from(home).join(".local/bin/temper-poll"));
-    }
-    for candidate in candidates {
-        if candidate.is_file() { return Some(candidate); }
-    }
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") { candidates.push(std::path::PathBuf::from(format!("/home/{}/.local/bin/temper-poll", sudo_user))); }
+    if let Ok(home) = std::env::var("HOME") { candidates.push(std::path::PathBuf::from(home).join(".local/bin/temper-poll")); }
+    for candidate in candidates { if candidate.is_file() { return Some(candidate); } }
     None
 }
 
@@ -430,36 +487,28 @@ fn get_desktop_idle_time() -> Option<Duration> {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             let script = format!("XDG_RUNTIME_DIR=/run/user/$(id -u {0}) DISPLAY=${{DISPLAY:-:0}} {1} {2}", sudo_user, cmd, args.join(" "));
             Command::new("sudo").args(["-u", &sudo_user, "sh", "-c", &script]).output()
-        } else {
-            Command::new(cmd).args(args).output()
-        }
+        } else { Command::new(cmd).args(args).output() }
     };
 
     if let Ok(out) = run_cmd("busctl", &["--user", "call", "org.gnome.Mutter.IdleMonitor", "/org/gnome/Mutter/IdleMonitor/Core", "org.gnome.Mutter.IdleMonitor", "GetIdletime"]) {
         let s = String::from_utf8_lossy(&out.stdout);
-        if let Some(t_str) = s.split_whitespace().last() {
-            if let Ok(ms) = t_str.parse::<u64>() { return Some(Duration::from_millis(ms)); }
-        }
+        if let Some(t_str) = s.split_whitespace().last() { if let Ok(ms) = t_str.parse::<u64>() { return Some(Duration::from_millis(ms)); } }
     }
 
     if let Ok(out) = run_cmd("busctl", &["--user", "call", "org.kde.Screensaver", "/ScreenSaver", "org.kde.Screensaver", "GetSessionIdleTime"]) {
         let s = String::from_utf8_lossy(&out.stdout);
-        if let Some(t_str) = s.split_whitespace().last() {
-            if let Ok(secs) = t_str.parse::<u32>() { return Some(Duration::from_secs(secs as u64)); }
-        }
+        if let Some(t_str) = s.split_whitespace().last() { if let Ok(secs) = t_str.parse::<u32>() { return Some(Duration::from_secs(secs as u64)); } }
     }
 
     if let Ok(out) = run_cmd("xprintidle", &[]) {
         let s = String::from_utf8_lossy(&out.stdout);
         if let Ok(ms) = s.trim().parse::<u64>() { return Some(Duration::from_millis(ms)); }
     }
-
     None
 }
 
 fn get_user_idle_time() -> Duration {
     let mut newest_time = SystemTime::UNIX_EPOCH;
-
     let mut check_dir = |path: &str, check_mtime: bool, prefix: &str| {
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
@@ -467,27 +516,18 @@ fn get_user_idle_time() -> Duration {
                 if prefix.is_empty() || fname.to_string_lossy().starts_with(prefix) {
                     if let Ok(meta) = entry.metadata() {
                         if let Ok(atime) = meta.accessed() { newest_time = newest_time.max(atime); }
-                        if check_mtime {
-                            if let Ok(mtime) = meta.modified() { newest_time = newest_time.max(mtime); }
-                        }
+                        if check_mtime { if let Ok(mtime) = meta.modified() { newest_time = newest_time.max(mtime); } }
                     }
                 }
             }
         }
     };
-
     check_dir("/dev/input", true, "");
     check_dir("/dev/pts", false, "");
     check_dir("/dev", false, "tty");
 
     let fs_idle = SystemTime::now().duration_since(newest_time).unwrap_or(Duration::ZERO);
-
-    if fs_idle.as_secs() > 1 {
-        if let Some(desktop_idle) = get_desktop_idle_time() {
-            return desktop_idle.min(fs_idle);
-        }
-    }
-
+    if fs_idle.as_secs() > 1 { if let Some(desktop_idle) = get_desktop_idle_time() { return desktop_idle.min(fs_idle); } }
     fs_idle
 }
 
@@ -499,41 +539,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut room_interval = DEFAULT_INTERVAL;
     let mut mem_interval = DEFAULT_INTERVAL;
     let mut net_interval = DEFAULT_INTERVAL;
+    let mut disk_interval = DEFAULT_INTERVAL;
 
     while let Some(arg) = args.next() {
-        if arg == "-h" || arg == "--help" {
-            print_help();
-            std::process::exit(0);
-        } else if arg.starts_with("-n") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) }
-            else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            cpu_interval = val.clamp(0.1, 60.0);
-        } else if arg.starts_with("-r") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) }
-            else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            room_interval = val.clamp(1.0, 3600.0);
-        } else if arg.starts_with("-m") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) }
-            else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            mem_interval = val.clamp(0.5, 60.0);
-        } else if arg.starts_with("-t") {
-            let val = if arg.len() > 2 { arg[2..].parse().unwrap_or(DEFAULT_INTERVAL) }
-            else { args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL) };
-            net_interval = val.clamp(0.5, 60.0);
+        match arg.as_str() {
+            "-h" | "--help" => { print_help(); std::process::exit(0); }
+            "-v" | "--version" => {
+                println!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", env!("CARGO_PKG_VERSION"));
+                println!("Copyright (C) 2026 StatusCode404 https://github.com/StatusCode404");
+                std::process::exit(0);
+            }
+            "-n" | "--cpu-stats-interval" => { cpu_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.1, 60.0); }
+            "-r" | "--room-temp-interval" => { room_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(1.0, 3600.0); }
+            "-m" | "--mem-stats-interval" => { mem_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            "-t" | "--net-interval" => { net_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            "-d" | "--disk-interval" => { disk_interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            _ => {
+                if arg.starts_with("-n") { cpu_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.1, 60.0); }
+                else if arg.starts_with("-r") { room_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(1.0, 3600.0); }
+                else if arg.starts_with("-m") { mem_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+                else if arg.starts_with("-t") { net_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+                else if arg.starts_with("-d") { disk_interval = arg[2..].parse().unwrap_or(DEFAULT_INTERVAL).clamp(0.5, 60.0); }
+            }
         }
     }
 
     let is_vm = is_virtual_machine();
+    let cpu_model_raw = fs::read_to_string("/proc/cpuinfo").unwrap_or_default().lines().find(|l| l.starts_with("model name") || l.starts_with("Processor") || l.starts_with("Hardware")).and_then(|l| l.split(':').nth(1)).map(|s| s.trim().to_string()).unwrap_or("Unknown".into());
 
-    let cpu_model_raw = fs::read_to_string("/proc/cpuinfo")
-        .unwrap_or_default()
-        .lines()
-        .find(|l| l.starts_with("model name") || l.starts_with("Processor") || l.starts_with("Hardware"))
-        .and_then(|l| l.split(':').nth(1))
-        .map(|s| s.trim().to_string())
-        .unwrap_or("Unknown".into());
-
-    // Formatted once strictly outside the 50ms loop to prevent constant String allocations
     let cpu_model_display = cpu_model_raw
         .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m")
         .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m")
@@ -543,34 +576,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .replace("IBM", "\x1b[1;38;2;31;112;193mIBM\x1b[0m\x1b[1m");
 
     let limits = (
-        fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq")
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .map(|k| k / 1000.0),
-        fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .map(|k| k / 1000.0),
+        fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq").ok().and_then(|s| s.trim().parse::<f64>().ok()).map(|k| k / 1000.0),
+        fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq").ok().and_then(|s| s.trim().parse::<f64>().ok()).map(|k| k / 1000.0),
     );
 
-    // MPSC Bound ensures memory fragmentation prevention by capping active nodes on the heap
     let (tx, rx) = mpsc::sync_channel::<Msg>(32);
 
-    // 1. CPU Thread - Buffer is instantiated ONCE outside the loop to prevent memory bloat over uptime.
+    // 1. CPU Thread
     let tx_cpu = tx.clone();
     thread::Builder::new().name("cg-cpu".to_string()).spawn(move || {
         let mut buf = String::with_capacity(8192);
+        let mut freqs = Vec::with_capacity(128);
         loop {
-            buf.clear(); // RAII: Reuse the buffer allocation, keeping stack/heap perfectly clean
+            buf.clear();
+            freqs.clear();
             if let Ok(mut file) = File::open("/proc/cpuinfo") { let _ = file.read_to_string(&mut buf); }
-           
-            let freqs = buf
-                .lines()
-                .filter(|l| l.starts_with("cpu MHz") || l.starts_with("BogoMIPS"))
-                .filter_map(|l| l.split(':').nth(1)?.trim().parse::<f64>().ok())
-                .collect();
-
-            if tx_cpu.send(Msg::CpuFreqs(freqs)).is_err() { break; }
+            for l in buf.lines() {
+                if l.starts_with("cpu MHz") || l.starts_with("BogoMIPS") {
+                    if let Some(val_str) = l.split(':').nth(1) {
+                        if let Ok(val) = val_str.trim().parse::<f64>() { freqs.push(val); }
+                    }
+                }
+            }
+            if tx_cpu.send(Msg::CpuFreqs(freqs.clone())).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(cpu_interval));
         }
     }).unwrap();
@@ -584,38 +612,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Room Temp Thread
     let tx_room = tx.clone();
-    thread::Builder::new().name("cg-room".to_string()).spawn(move || loop {
+    thread::Builder::new().name("cg-room".to_string()).spawn(move || {
+        // Hoisted discovery: Resolves driver location path ONLY ONCE rather than polling `which` recursively on loop
         let cmd_path = find_temper_poll().unwrap_or_else(|| std::path::PathBuf::from("temper-poll"));
-
-        let out = Command::new(&cmd_path).output();
-        let msg = if let Ok(o) = out {
-            let s = String::from_utf8_lossy(&o.stdout);
-            if let Some(line) = s.lines().find(|l| l.contains("Device #0:")) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(temp_str) = parts.iter().find(|p| p.contains('°')) {
-                    let clean_temp = temp_str.replace('°', "").replace('C', "");
-                    if let Ok(temp) = clean_temp.parse::<f64>() {
-                        let mut final_temp = format!("{}\x1b[1m{:.1}°C\x1b[0m", get_room_temp_color(temp), temp);
-                        if temp >= 40.0 {
-                            final_temp.push_str(" \x1b[1;38;2;255;165;0mWARNING:\x1b[0m \x1b[1;38;2;238;130;238mAmbient Temp is too HOT! Consider Shutting Down!\x1b[0m");
-                        }
-                        final_temp
+        loop {
+            let out = Command::new(&cmd_path).output();
+            let msg = if let Ok(o) = out {
+                let s = String::from_utf8_lossy(&o.stdout);
+                if let Some(line) = s.lines().find(|l| l.contains("Device #0:")) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(temp_str) = parts.iter().find(|p| p.contains('°')) {
+                        let clean_temp = temp_str.replace('°', "").replace('C', "");
+                        if let Ok(temp) = clean_temp.parse::<f64>() {
+                            let mut final_temp = format!("{}\x1b[1m{:.1}°C\x1b[0m", get_room_temp_color(temp), temp);
+                            if temp >= 40.0 { final_temp.push_str(" \x1b[1;38;2;255;165;0mWARNING:\x1b[0m \x1b[1;38;2;238;130;238mAmbient Temp is too HOT! Consider Shutting Down!\x1b[0m"); }
+                            final_temp
+                        } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
                     } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
                 } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
-            } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
-        } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() };
+            } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() };
 
-        if tx_room.send(Msg::RoomTemp(msg)).is_err() { break; }
-        thread::sleep(Duration::from_secs_f64(room_interval));
+            if tx_room.send(Msg::RoomTemp(msg)).is_err() { break; }
+            thread::sleep(Duration::from_secs_f64(room_interval));
+        }
     }).unwrap();
 
-    // 4. Memory Thread (RAM & Swap/Zswap)
+    // 4. Memory Thread
     let tx_mem = tx.clone();
     thread::Builder::new().name("cg-mem".to_string()).spawn(move || {
         let mut mem_buf = String::with_capacity(2048);
         let mut swap_buf = String::with_capacity(2048);
+        let mut parsed_swaps = Vec::with_capacity(8);
+        let mut swap_devices_formatted = Vec::with_capacity(8);
+
         loop {
             mem_buf.clear();
+            swap_buf.clear();
+            parsed_swaps.clear();
+            swap_devices_formatted.clear();
+
             if let Ok(mut file) = File::open("/proc/meminfo") { let _ = file.read_to_string(&mut mem_buf); }
             let (mut total, mut avail) = (0u64, 0u64);
             for line in mem_buf.lines() {
@@ -625,8 +660,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if p[0] == "MemTotal:" { total = val; }
                 else if p[0] == "MemAvailable:" { avail = val; }
             }
-            let used = total.saturating_sub(avail);
-            let ram_percent = if total > 0 { used as f64 / total as f64 } else { 0.0 };
+           
+            // KB converted directly into Bytes to ensure strict UI scaling string boundaries
+            let used_bytes = total.saturating_sub(avail) * 1024;
+            let avail_bytes = avail * 1024;
+            let total_bytes = total * 1024;
+           
+            let ram_percent = if total > 0 { (total - avail) as f64 / total as f64 } else { 0.0 };
             let mem_color = get_ram_color(ram_percent);
 
             let wb_used_parent = "\x1b[1;37mUsed\x1b[0m";
@@ -634,71 +674,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wb_total_parent = "\x1b[1;37mTotal\x1b[0m";
             let cyan_bold = "\x1b[1;38;2;0;255;255m";
 
-            let ram_str = format!(
-                "{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {col}\x1b[1m{}\x1b[0m {wb_avail_parent} | {cya}{}\x1b[0m {wb_total_parent}",
-                format_size(used), format_size(avail), format_size(total), col=mem_color, wb_used_parent=wb_used_parent, wb_avail_parent=wb_avail_parent, cya=cyan_bold
-            );
+            let ram_str = format!("{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {col}\x1b[1m{}\x1b[0m {wb_avail_parent} | {cya}{}\x1b[0m {wb_total_parent}",
+                format_size(used_bytes), format_size(avail_bytes), format_size(total_bytes), col=mem_color, wb_used_parent=wb_used_parent, wb_avail_parent=wb_avail_parent, cya=cyan_bold);
 
-            swap_buf.clear();
             if let Ok(mut file) = File::open("/proc/swaps") { let _ = file.read_to_string(&mut swap_buf); }
             let mut total_swap = 0u64;
             let mut total_swap_used = 0u64;
-            let mut swap_devices_formatted = Vec::new();
-
+           
             for line in swap_buf.lines().skip(1) {
                 let p: Vec<&str> = line.split_whitespace().collect();
                 if p.len() >= 4 {
-                    let size = p[2].parse::<u64>().unwrap_or(0);
-                    let used = p[3].parse::<u64>().unwrap_or(0);
-                    total_swap += size;
-                    total_swap_used += used;
-                    let swap_percent = if size > 0 { used as f64 / size as f64 } else { 0.0 };
-                   
-                    let col = get_swap_color(swap_percent);
-                    // Child nodes formatted with a leading space for clean 1-character indentation under Swap parent line
-                    swap_devices_formatted.push(format!(" {}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
-                        p[0].split('/').last().unwrap_or("swap"),
-                        format_size(used),
-                        format_size(size),
-                        col=col
-                    ));
+                    let size_bytes = p[2].parse::<u64>().unwrap_or(0) * 1024;
+                    let used_bytes = p[3].parse::<u64>().unwrap_or(0) * 1024;
+                    total_swap += size_bytes;
+                    total_swap_used += used_bytes;
+                    parsed_swaps.push((p[0].split('/').last().unwrap_or("swap").to_string(), used_bytes, size_bytes));
                 }
+            }
+
+            // Align all Swap rows by finding the max name length.
+            // Fixed width left strings mathematically ensures UI right alignment on `Total`.
+            let max_swap_len = parsed_swaps.iter().map(|(n, _, _)| n.len()).max().unwrap_or(4);
+           
+            for (name, used_bytes, size_bytes) in &parsed_swaps {
+                let swap_percent = if *size_bytes > 0 { *used_bytes as f64 / *size_bytes as f64 } else { 0.0 };
+                let col = get_swap_color(swap_percent);
+                swap_devices_formatted.push(format!(" {:<width$}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
+                    name, format_size(*used_bytes), format_size(*size_bytes), col=col, width=max_swap_len));
             }
 
             let total_swap_percent = if total_swap > 0 { total_swap_used as f64 / total_swap as f64 } else { 0.0 };
             let swap_col = get_swap_color(total_swap_percent);
-            let swap_total_str = format!(
-                "{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {cya}{}\x1b[0m {wb_total_parent} | {col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
-                format_size(total_swap_used), format_size(total_swap), total_swap_percent * 100.0, col=swap_col, wb_used_parent=wb_used_parent, wb_total_parent=wb_total_parent, cya=cyan_bold
-            );
+            let swap_total_str = format!("{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {cya}\x1b[1m{}\x1b[0m {wb_total_parent} | {col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
+                format_size(total_swap_used), format_size(total_swap), total_swap_percent * 100.0, col=swap_col, wb_used_parent=wb_used_parent, wb_total_parent=wb_total_parent, cya=cyan_bold);
 
             let zswap_param_path = std::path::Path::new("/sys/module/zswap/parameters/enabled");
-            let zswap_str = if !zswap_param_path.exists() {
-                format!("\x1b[38;2;238;130;238m\x1b[1mNot Present\x1b[0m")
-            } else {
+            let zswap_str = if !zswap_param_path.exists() { format!("\x1b[38;2;238;130;238m\x1b[1mNot Present\x1b[0m") }
+            else {
                 match fs::read_to_string(zswap_param_path) {
                     Ok(val) => match val.trim() {
                         "Y" => {
-                            match (
-                                fs::read_to_string("/sys/kernel/debug/zswap/pool_total_size"),
-                                fs::read_to_string("/sys/kernel/debug/zswap/stored_pages"),
-                            ) {
+                            match (fs::read_to_string("/sys/kernel/debug/zswap/pool_total_size"), fs::read_to_string("/sys/kernel/debug/zswap/stored_pages")) {
                                 (Ok(p_str), Ok(pg_str)) => {
-                                    let pool = p_str.trim().parse::<u64>().unwrap_or(0);
+                                    let pool_bytes = p_str.trim().parse::<u64>().unwrap_or(0);
                                     let pages = pg_str.trim().parse::<u64>().unwrap_or(0);
-                                    let ratio = if pool > 0 { (pages * 4 * 1024) as f64 / (pool as f64) } else { 0.0 };
-                                    let pool_color = if pool > 0 { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;150;150;150m" };
+                                    let ratio = if pool_bytes > 0 { (pages * 4 * 1024) as f64 / (pool_bytes as f64) } else { 0.0 };
+                                    let pool_color = if pool_bytes > 0 { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;150;150;150m" };
                                     let ratio_color = if ratio > 0.0 { get_ratio_color(ratio) } else { "\x1b[0m".to_string() };
-
-                                    let algo = fs::read_to_string("/sys/module/zswap/parameters/compressor")
-                                        .unwrap_or_else(|_| "unknown".to_string());
+                                    let algo = fs::read_to_string("/sys/module/zswap/parameters/compressor").unwrap_or_else(|_| "unknown".to_string());
                                     let algo_trim = algo.trim();
                                     let algo_color = get_zswap_algo_color(algo_trim);
-
-                                    format!(
-                                        "\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m | \x1b[1mAlgo:\x1b[0m {algo_color}\x1b[1m{algo_trim}\x1b[0m | \x1b[1mPool:\x1b[0m {pool_color}\x1b[1m{}\x1b[0m | \x1b[1mRatio:\x1b[0m {ratio_color}\x1b[1m{:.1}:1\x1b[0m",
-                                        format_size(pool / 1024), ratio
-                                    )
+                                    format!("\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m | \x1b[1mAlgo:\x1b[0m {algo_color}\x1b[1m{algo_trim}\x1b[0m | \x1b[1mPool:\x1b[0m {pool_color}\x1b[1m{}\x1b[0m | \x1b[1mRatio:\x1b[0m {ratio_color}\x1b[1m{:.1}:1\x1b[0m", format_size(pool_bytes), ratio)
                                 }
                                 _ => format!("\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m (\x1b[38;2;255;255;0m\x1b[1mRequires sudo for detailed stats\x1b[0m)"),
                             }
@@ -710,12 +736,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            if tx_mem.send(Msg::MemStats {
-                ram_str,
-                zswap_str,
-                swap_total_str,
-                swaps_formatted: swap_devices_formatted, // Forward pure pre-formatted strings
-            }).is_err() { break; }
+            if tx_mem.send(Msg::MemStats { ram_str, zswap_str, swap_total_str, swaps_formatted: swap_devices_formatted.clone() }).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(mem_interval));
         }
     }).unwrap();
@@ -723,57 +744,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Network Thread
     let tx_net = tx.clone();
     thread::Builder::new().name("cg-net".to_string()).spawn(move || {
-        let mut prev_stats: HashMap<String, (u64, u64, Instant)> = HashMap::new();
-        // Variables hoisted out of the loop to prevent repeated allocations/drops over long uptimes
+        let mut prev_stats: HashMap<String, (u64, u64, Instant)> = HashMap::with_capacity(16);
         let mut current_stats = Vec::with_capacity(8);
         let mut current_keys = HashSet::with_capacity(8);
+        let mut dev_str = String::with_capacity(4096);
        
         loop {
             current_stats.clear();
             current_keys.clear();
+            dev_str.clear();
             let now = Instant::now();
 
-            if let Ok(dev_str) = fs::read_to_string("/proc/net/dev") {
-                for line in dev_str.lines().skip(2) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() < 17 { continue; }
-                    let iface = parts[0].trim_end_matches(':').to_string();
-                    if iface == "lo" { continue; }
+            if let Ok(mut file) = File::open("/proc/net/dev") { let _ = file.read_to_string(&mut dev_str); }
+            for line in dev_str.lines().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 17 { continue; }
+                let iface = parts[0].trim_end_matches(':').to_string();
+                if iface == "lo" { continue; }
 
-                    let rx = parts[1].parse::<u64>().unwrap_or(0);
-                    let tx = parts[9].parse::<u64>().unwrap_or(0);
-                    current_keys.insert(iface.clone());
+                let rx = parts[1].parse::<u64>().unwrap_or(0);
+                let tx = parts[9].parse::<u64>().unwrap_or(0);
+                current_keys.insert(iface.clone());
 
-                    let speed_mbps = fs::read_to_string(format!("/sys/class/net/{}/speed", iface))
-                        .ok()
-                        .and_then(|s| s.trim().parse::<f64>().ok())
-                        .unwrap_or(1000.0);
+                let speed_mbps = fs::read_to_string(format!("/sys/class/net/{}/speed", iface)).ok().and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(1000.0);
+                let max_bytes_per_sec = speed_mbps * 1_000_000.0 / 8.0;
 
-                    let max_bytes_per_sec = speed_mbps * 1_000_000.0 / 8.0;
+                let (rx_speed, tx_speed) = if let Some(&(prev_rx, prev_tx, prev_time)) = prev_stats.get(&iface) {
+                    let duration = now.duration_since(prev_time).as_secs_f64();
+                    if duration > 0.0 { (rx.saturating_sub(prev_rx) as f64 / duration, tx.saturating_sub(prev_tx) as f64 / duration) } else { (0.0, 0.0) }
+                } else {
+                    let _ = tx_net.send(Msg::NetEvent(iface.clone(), "ACTIVATED".to_string()));
+                    (0.0, 0.0)
+                };
 
-                    let (rx_speed, tx_speed) = if let Some(&(prev_rx, prev_tx, prev_time)) = prev_stats.get(&iface) {
-                        let duration = now.duration_since(prev_time).as_secs_f64();
-                        if duration > 0.0 {
-                            (rx.saturating_sub(prev_rx) as f64 / duration, tx.saturating_sub(prev_tx) as f64 / duration)
-                        } else { (0.0, 0.0) }
-                    } else {
-                        let _ = tx_net.send(Msg::NetEvent(iface.clone(), "ACTIVATED".to_string()));
-                        (0.0, 0.0)
-                    };
-
-                    current_stats.push((iface.clone(), rx_speed, tx_speed, max_bytes_per_sec));
-                    prev_stats.insert(iface, (rx, tx, now));
-                }
+                current_stats.push((iface.clone(), rx_speed, tx_speed, max_bytes_per_sec));
+                prev_stats.insert(iface, (rx, tx, now));
             }
 
-            let mut to_remove = Vec::new();
-            for old_iface in prev_stats.keys() {
-                if !current_keys.contains(old_iface) {
-                    to_remove.push(old_iface.clone());
-                    let _ = tx_net.send(Msg::NetEvent(old_iface.clone(), "DEACTIVATED".to_string()));
-                }
-            }
-            for rm in to_remove { prev_stats.remove(&rm); }
+            // Zero Allocation Memory Sweep
+            prev_stats.retain(|k, _| {
+                let keep = current_keys.contains(k);
+                if !keep { let _ = tx_net.send(Msg::NetEvent(k.clone(), "DEACTIVATED".to_string())); }
+                keep
+            });
 
             if tx_net.send(Msg::NetStats(current_stats.clone())).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(net_interval));
@@ -786,6 +799,195 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             if tx_idle.send(Msg::UserIdle(get_user_idle_time())).is_err() { break; }
             thread::sleep(Duration::from_secs(1));
+        }
+    }).unwrap();
+
+    // --- Storage Telemetry Prototype Thread (v3.0.0) ---
+    let tx_disk = tx.clone();
+    thread::Builder::new().name("cg-disk".to_string()).spawn(move || {
+        let mut prev_disk_stats: HashMap<String, (u64, u64, Instant)> = HashMap::with_capacity(16);
+        let allowed_fs: HashSet<&str> = ["ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "vfat", "exfat", "ntfs", "ntfs3", "f2fs"].into_iter().collect();
+
+        // Hoisted allocations to protect background memory layout from heap fragmentation bloat over uptime.
+        let mut mount_caps: HashMap<u64, (u64, u64, String, String, String)> = HashMap::with_capacity(16);
+        let mut dev_traffic: HashMap<String, (f64, f64)> = HashMap::with_capacity(16);
+        let mut disk_cap_nodes = Vec::with_capacity(16);
+        let mut disk_io_nodes = Vec::with_capacity(16);
+        let mut hw_trackers: HashMap<String, HrHwState> = HashMap::with_capacity(16);
+        let mut global_hw = HrHwState::new();
+        let mut active_devs = HashSet::with_capacity(16);
+
+        let mut mounts_str = String::with_capacity(4096);
+        let mut diskstats_str = String::with_capacity(8192);
+
+        loop {
+            mount_caps.clear();
+            dev_traffic.clear();
+            disk_cap_nodes.clear();
+            disk_io_nodes.clear();
+            active_devs.clear();
+            mounts_str.clear();
+            diskstats_str.clear();
+
+            // 1. Gather Disk Capacities & Deduplicate Pools
+            if let Ok(mut f) = File::open("/proc/mounts") { let _ = f.read_to_string(&mut mounts_str); }
+            for line in mounts_str.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 6 { continue; }
+                let dev = parts[0];
+                let mount = parts[1];
+                let fs_type = parts[2];
+
+                if allowed_fs.contains(fs_type) {
+                    use std::ffi::CString;
+                    if let Ok(c_path) = CString::new(mount) {
+                        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+                        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } == 0 {
+                            let total_bytes = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
+                            let free_bytes = (stat.f_bfree as u64).saturating_mul(stat.f_frsize as u64);
+                            let used_bytes = total_bytes.saturating_sub(free_bytes);
+                            let fsid = stat.f_fsid as u64;
+
+                            if let Some(existing) = mount_caps.get_mut(&fsid) {
+                                if mount.len() < existing.2.len() {
+                                    existing.2 = mount.to_string();
+                                }
+                            } else {
+                                mount_caps.insert(fsid, (total_bytes, used_bytes, mount.to_string(), fs_type.to_string(), dev.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Gather Real-Time I/O Traffic natively via diskstats
+            let now = Instant::now();
+            if let Ok(mut f) = File::open("/proc/diskstats") { let _ = f.read_to_string(&mut diskstats_str); }
+            for line in diskstats_str.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 14 {
+                    let dev_name = parts[2];
+                    let sectors_read = parts[5].parse::<u64>().unwrap_or(0);
+                    let sectors_written = parts[9].parse::<u64>().unwrap_or(0);
+                   
+                    let bytes_read = sectors_read * 512;
+                    let bytes_written = sectors_written * 512;
+
+                    let (r_speed, w_speed) = if let Some(&(p_read, p_write, p_time)) = prev_disk_stats.get(dev_name) {
+                        let duration = now.duration_since(p_time).as_secs_f64();
+                        if duration > 0.0 {
+                            (bytes_read.saturating_sub(p_read) as f64 / duration, bytes_written.saturating_sub(p_write) as f64 / duration)
+                        } else { (0.0, 0.0) }
+                    } else { (0.0, 0.0) };
+
+                    dev_traffic.insert(dev_name.to_string(), (r_speed, w_speed));
+                    prev_disk_stats.insert(dev_name.to_string(), (bytes_read, bytes_written, now));
+                }
+            }
+
+            // 3. Format Strings for UI Layer
+            let mut agg_total = 0u64;
+            let mut agg_used = 0u64;
+            let mut agg_read_speed = 0.0;
+            let mut agg_write_speed = 0.0;
+            let mut force_violet_parent = false;
+
+            let mut sorted_mounts: Vec<_> = mount_caps.values().collect();
+            sorted_mounts.sort_by(|a, b| a.2.cmp(&b.2));
+
+            let max_mount_len = sorted_mounts.iter().map(|t| t.2.chars().count()).max().unwrap_or(4);
+
+            for tuple in &sorted_mounts {
+                let total_bytes: u64 = (*tuple).0;
+                let used_bytes: u64 = (*tuple).1;
+                let mount: &String = &(*tuple).2;
+                let fs_type: &String = &(*tuple).3;
+                let dev: &String = &(*tuple).4;
+
+                if total_bytes == 0 { continue; }
+                agg_total += total_bytes;
+                agg_used += used_bytes;
+
+                let raw_dev_name = if let Ok(path) = fs::canonicalize(dev) {
+                    path.file_name().unwrap_or_default().to_string_lossy().to_string()
+                } else {
+                    dev.split('/').last().unwrap_or("").to_string()
+                };
+
+                active_devs.insert(raw_dev_name.clone());
+
+                let (r_speed, w_speed) = dev_traffic.get(&raw_dev_name).unwrap_or(&(0.0, 0.0));
+               
+                let hw = hw_trackers.entry(raw_dev_name.clone()).or_insert_with(HrHwState::new);
+                hw.update(*r_speed, *w_speed);
+
+                agg_read_speed += *r_speed;
+                agg_write_speed += *w_speed;
+
+                let percent = used_bytes as f64 / total_bytes as f64;
+                let is_cow = fs_type.contains("btrfs") || fs_type.contains("zfs");
+                let capacity_color = get_disk_capacity_color(percent, is_cow);
+                if percent >= (if is_cow { 0.85 } else { 0.95 }) { force_violet_parent = true; }
+
+                disk_cap_nodes.push(format!(" {:<width$}: {color}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
+                    mount, format_size(used_bytes), format_size(total_bytes), color=capacity_color, width=max_mount_len
+                ));
+
+                let r_color = get_exp_disk_speed_color(*r_speed, hw.current_r);
+                let w_color = get_exp_disk_speed_color(*w_speed, hw.current_w);
+               
+                let hr_col = if hw.current_r > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+                let hw_col = if hw.current_w > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+
+                disk_io_nodes.push(format!("{}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m  {hr_col}HR:\x1b[0m{}  {hw_col}HW:\x1b[0m{}",
+                    r_color, format_disk_speed(*r_speed),
+                    w_color, format_disk_speed(*w_speed),
+                    format_disk_speed(hw.current_r),
+                    format_disk_speed(hw.current_w)
+                ));
+            }
+
+            let agg_percent = if agg_total > 0 { agg_used as f64 / agg_total as f64 } else { 0.0 };
+            let mut parent_color = get_disk_capacity_color(agg_percent, false);
+            if force_violet_parent { parent_color = "\x1b[1;38;2;238;130;238m".to_string(); }
+           
+            global_hw.update(agg_read_speed, agg_write_speed);
+            let r_parent_color = get_exp_disk_speed_color(agg_read_speed, global_hw.current_r);
+            let w_parent_color = get_exp_disk_speed_color(agg_write_speed, global_hw.current_w);
+            let hr_p_col = if global_hw.current_r > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+            let hw_p_col = if global_hw.current_w > 0.0 { "\x1b[1;31m" } else { "\x1b[1;37m" };
+
+            let disk_cap_parent = format!(
+                "\x1b[1mStorage Space Total:\x1b[0m {p_col}\x1b[1m{}\x1b[0m \x1b[1;37mUsed\x1b[0m | \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[1;37mTotal\x1b[0m | {p_col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
+                format_size(agg_used), format_size(agg_total), agg_percent * 100.0, p_col=parent_color
+            );
+
+            let disk_io_parent = format!(
+                "\x1b[1mStorage \x1b[1m↓↑\x1b[0m \x1b[1mTotal:\x1b[0m {}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m  {hr_p_col}HR:\x1b[0m{}  {hw_p_col}HW:\x1b[0m{}",
+                r_parent_color, format_disk_speed(agg_read_speed),
+                w_parent_color, format_disk_speed(agg_write_speed),
+                format_disk_speed(global_hw.current_r),
+                format_disk_speed(global_hw.current_w)
+            );
+
+            let disk_combined_parent = format!(
+                "\x1b[1mStorage Total:\x1b[0m {p_col}\x1b[1m{}\x1b[0m \x1b[1;37mUsed\x1b[0m | \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[1;37mTotal\x1b[0m | {p_col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m | {}\x1b[1m{}\x1b[0m \x1b[1;37mR↑\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37mW↓\x1b[0m  {hr_p_col}HR:\x1b[0m{}  {hw_p_col}HW:\x1b[0m{}",
+                format_size(agg_used), format_size(agg_total), agg_percent * 100.0,
+                r_parent_color, format_disk_speed(agg_read_speed),
+                w_parent_color, format_disk_speed(agg_write_speed),
+                format_disk_speed(global_hw.current_r),
+                format_disk_speed(global_hw.current_w),
+                p_col=parent_color
+            );
+
+            prev_disk_stats.retain(|k, _| active_devs.contains(k));
+            hw_trackers.retain(|k, _| active_devs.contains(k));
+
+            if tx_disk.send(Msg::DiskStats {
+                disk_cap_parent, disk_io_parent, disk_combined_parent,
+                disk_cap_nodes: disk_cap_nodes.clone(), disk_io_nodes: disk_io_nodes.clone()
+            }).is_err() { break; }
+            thread::sleep(Duration::from_secs_f64(disk_interval));
         }
     }).unwrap();
 
@@ -808,23 +1010,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_total_str: "Loading...".into(),
         net_stats: vec![],
         net_events: HashMap::new(),
+        disk_cap_parent: "Loading...".into(),
+        disk_io_parent: "Loading...".into(),
+        disk_combined_parent: "Loading...".into(),
+        disk_cap_nodes: vec![],
+        disk_io_nodes: vec![],
         idle_time: Duration::ZERO,
     };
+
+    // Pre-allocated UI Render Buffer array to prevent heap fragmentations when rendering Dynamic Layout 2-col grids.
+    let mut combined_disk_nodes = Vec::with_capacity(16);
 
     loop {
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q')
-                    || key.code == KeyCode::Char('Q')
-                    || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-                {
-                    break;
-                }
+                if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) { break; }
             }
         }
 
-        // Process message queue natively.
-        // This transfers pre-formatted strings directly into the render state, shielding the 50ms UI loop from runtime memory allocation logic.
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::CpuFreqs(f) => state.freqs = f,
@@ -840,10 +1043,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut total_rx = 0.0;
                     let mut total_tx = 0.0;
                     let mut total_max = 0.0;
+                    state.net_stats.clear();
                    
-                    // Reusable buffer to prevent loop leaks
-                    let mut net_nodes = Vec::with_capacity(n.len() + state.net_events.len());
-
                     let align_len = 9.max(n.iter().map(|(iface, _, _, _)| iface.len()).max().unwrap_or(0));
 
                     for (iface, rx_speed, tx_speed, max_bytes) in &n {
@@ -854,28 +1055,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some((ev, time)) = state.net_events.get(iface) {
                             if time.elapsed().as_secs() < 5 {
                                 let ev_color = if ev == "ACTIVATED" { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;255;255;0m" };
-                                net_nodes.push(format!("{:>width$}: \x1b[1m{}{}{}\x1b[0m", iface, ev_color, ev, "\x1b[0m", width=align_len));
+                                state.net_stats.push(format!("{:>width$}: \x1b[1m{}{}{}\x1b[0m", iface, ev_color, ev, "\x1b[0m", width=align_len));
                                 continue;
                             }
                         }
 
                         let rx_col = get_net_color(*rx_speed, *max_bytes);
                         let tx_col = get_net_color(*tx_speed, *max_bytes);
-                       
                         let rx_str = format_net_speed(*rx_speed);
                         let tx_str = format_net_speed(*tx_speed);
                        
-                        net_nodes.push(format!("{:>width$}: {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
-                            iface,
-                            rx_col, rx_str,
-                            tx_col, tx_str,
-                            width=align_len
-                        ));
+                        state.net_stats.push(format!("{:>width$}: {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
+                            iface, rx_col, rx_str, tx_col, tx_str, width=align_len));
                     }
 
                     for (iface, (ev, time)) in &state.net_events {
                         if ev == "DEACTIVATED" && time.elapsed().as_secs() < 5 {
-                            net_nodes.push(format!("{:>width$}: \x1b[38;2;255;255;0m\x1b[1mDEACTIVATED\x1b[0m", iface, width=align_len));
+                            state.net_stats.push(format!("{:>width$}: \x1b[38;2;255;255;0m\x1b[1mDEACTIVATED\x1b[0m", iface, width=align_len));
                         }
                     }
 
@@ -883,21 +1079,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let total_tx_col = get_net_color(total_tx, total_max.max(1.0));
 
                     state.net_total_str = format!("\x1b[1m{:>width$}:\x1b[0m {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
-                        "Net Total",
-                        total_rx_col, format_net_speed(total_rx),
-                        total_tx_col, format_net_speed(total_tx),
-                        width=align_len
-                    );
-                    state.net_stats = net_nodes;
+                        "Net Total", total_rx_col, format_net_speed(total_rx), total_tx_col, format_net_speed(total_tx), width=align_len);
                 },
-                Msg::NetEvent(iface, event_str) => {
-                    state.net_events.insert(iface, (event_str, Instant::now()));
-                }
+                Msg::DiskStats { disk_cap_parent, disk_io_parent, disk_combined_parent, disk_cap_nodes, disk_io_nodes } => {
+                    state.disk_cap_parent = disk_cap_parent;
+                    state.disk_io_parent = disk_io_parent;
+                    state.disk_combined_parent = disk_combined_parent;
+                    state.disk_cap_nodes = disk_cap_nodes;
+                    state.disk_io_nodes = disk_io_nodes;
+                },
+                Msg::NetEvent(iface, event_str) => { state.net_events.insert(iface, (event_str, Instant::now())); },
                 Msg::UserIdle(d) => state.idle_time = d,
             }
         }
        
-        // Purge expired events. Protects against HashMap heap fragmentation bloat over extensive uptime periods.
         state.net_events.retain(|_, (_, time)| time.elapsed().as_secs() < 5);
 
         let (max_w, max_h) = terminal::size()?;
@@ -912,7 +1107,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout.queue(cursor::MoveTo(0, 0))?;
         let mut row = 0;
 
-        // Passed as `&str` reference specifically to guarantee zero-heap allocations inside the 50ms (20fps) UI rendering loop.
         let print_line = |row: &mut u16, text: &str, stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
             if *row < max_h {
                 stdout.queue(cursor::MoveTo(0, *row))?;
@@ -923,9 +1117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
-        // Standardized 2-Column Grid Renderer for dynamic UI layouts.
         let print_aligned_2col_grid = |row: &mut u16, items: &[String], max_w: usize, stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
-            // First, calculate the longest column 1 width purely for this specific grid array to prevent global alignment bleed.
             let mut col1_w = 0;
             let mut check_idx = 0;
             while check_idx < items.len() {
@@ -935,7 +1127,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut i = 0;
-           
             while i < items.len() {
                 let item1 = &items[i];
                 let len1 = strip_ansi(item1);
@@ -944,7 +1135,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let item2 = &items[i+1];
                     let len2 = strip_ansi(item2);
 
-                    // If combining both items doesn't exceed terminal width limits, place side-by-side.
                     if col1_w + 3 + len2 <= max_w {
                         let pad = " ".repeat(col1_w.saturating_sub(len1));
                         print_line(row, &format!("{}{} | {}", item1, pad, item2), stdout)?;
@@ -958,7 +1148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
-        // Render Dynamic Header Blocks
+        // --- Render Header & Core Limits ---
         let version = env!("CARGO_PKG_VERSION");
         print_line(&mut row, &format!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
         print_line(&mut row, &format!("\x1b[1m{}\x1b[0m", state.cpu_model_display), &mut stdout)?;
@@ -980,7 +1170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_line(&mut row, &format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m{}IDLE {}\x1b[0m", get_idle_color(idle_secs), format_idle_time(idle_secs)), &mut stdout)?;
         }
 
-        if row < max_h - 1 {
+        // --- Render Temperatures Heat-Map ---
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mTemperature Heat-Map\x1b[0m"))?;
@@ -989,7 +1180,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         print_line(&mut row, &format!("\x1b[1mRoom Temp:\x1b[0m {}", state.room_temp), &mut stdout)?;
 
-        // Render Dynamic CPU Temps
         for (parent, chiplets) in &state.cpu_temps {
             if chiplets.is_empty() { continue; }
             print_line(&mut row, &format!("\x1b[1mCPU Temps ({}):\x1b[0m", parent), &mut stdout)?;
@@ -997,11 +1187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cols = (max_w as usize / MIN_CELL_WIDTH).max(1).min(chiplets.len().max(1));
             let temp_rows = (chiplets.len() + cols - 1) / cols;
            
-            // Calculate longest label dynamically to right-justify temp labels perfectly like Core Heat-Map
             let max_lbl = chiplets.iter().map(|c| c.label.len()).max().unwrap_or(4).max(4);
 
             for r in 0..temp_rows {
-                if row >= max_h - 1 { break; }
+                if row >= max_h { break; }
                 stdout.queue(cursor::MoveTo(0, row))?;
                 stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
                 for c in 0..cols {
@@ -1010,7 +1199,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let stat = &chiplets[idx];
                         let sep = if c < cols - 1 { " | " } else { "" };
                         let fw = if stat.is_parent { "\x1b[1m" } else { "" };
-                        // Forces 4-character temp reading (e.g. 45.0) and exactly aligned labels
                         write!(stdout, "{}{:>width$}: {}{:4.1}°C\x1b[0m{}", fw, stat.label, stat.color, stat.val, sep, width=max_lbl)?;
                     }
                 }
@@ -1018,15 +1206,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let core_msg = if state.freqs.is_empty() {
-            "Error: Core Frequencies cannot be accessed"
-        } else if is_vm {
-            "VM Guest Detected"
-        } else {
-            "Core Heat-Map"
-        };
+        // --- Render Core Heat-Map ---
+        let core_msg = if state.freqs.is_empty() { "Error: Core Frequencies cannot be accessed" }
+                       else if is_vm { "VM Guest Detected" }
+                       else { "Core Heat-Map" };
 
-        if row < max_h - 1 {
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, &format!("\x1b[1;38;2;255;215;0m{}\x1b[0m", core_msg)))?;
@@ -1037,21 +1222,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cpu_rows = (state.freqs.len() + cols - 1) / cols;
 
         for r in 0..cpu_rows {
-            if row >= max_h - 1 { break; }
+            if row >= max_h { break; }
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             for c in 0..cols {
                 let idx = r * cols + c;
                 if idx < state.freqs.len() {
                     let freq = state.freqs[idx];
-                    let color = if let (Some(min), Some(max)) = state.limits {
-                        get_cpu_color((freq - min) / (max - min))
-                    } else { String::new() };
-
-                    let (display_freq, unit) = if freq >= 1_000_000.0 { (freq / 1_000_000.0, "THz") }
-                    else if freq >= 1000.0 { (freq / 1000.0, "GHz") }
-                    else { (freq, "MHz") };
-                   
+                    let color = if let (Some(min), Some(max)) = state.limits { get_cpu_color((freq - min) / (max - min)) } else { String::new() };
+                    let (display_freq, unit) = if freq >= 1_000_000.0 { (freq / 1_000_000.0, "THz") } else if freq >= 1000.0 { (freq / 1000.0, "GHz") } else { (freq, "MHz") };
                     let sep = if c < cols - 1 { " | " } else { "" };
                     let freq_str = format_dynamic_6(display_freq);
                    
@@ -1061,41 +1240,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             row += 1;
         }
 
-        if row < max_h - 1 {
+        // --- Render Memory Heat-Map ---
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mMemory Heat-Map\x1b[0m"))?;
             row += 1;
         }
 
-        // --- Memory Formatting ---
         print_line(&mut row, &format!("\x1b[1mRAM:\x1b[0m {}", state.mem_ram_str), &mut stdout)?;
         print_line(&mut row, &format!("\x1b[1mZswap:\x1b[0m {}", state.mem_zswap_str), &mut stdout)?;
         print_line(&mut row, &format!("\x1b[1mSwap:\x1b[0m {}", state.mem_swap_total_str), &mut stdout)?;
-
-        // Send swap array through the self-aligning 2-col renderer
         print_aligned_2col_grid(&mut row, &state.swaps_formatted, max_w as usize, &mut stdout)?;
 
-        if row < max_h - 1 {
+        // --- Render Network Heat-Map ---
+        if row < max_h {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
             write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mNetwork Heat-Map\x1b[0m"))?;
             row += 1;
         }
 
-        // --- Network Grid Formatting ---
         print_line(&mut row, &state.net_total_str, &mut stdout)?;
-       
-        // Send network array through the self-aligning 2-col renderer
         print_aligned_2col_grid(&mut row, &state.net_stats, max_w as usize, &mut stdout)?;
-       
-        if row < max_h - 1 {
-            stdout.queue(cursor::MoveTo(0, row))?;
-            stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", "-".repeat(max_w as usize))?;
+
+        // --- Render Storage Telemetry (Dynamic Split) ---
+        let max_cap_len = state.disk_cap_nodes.iter().map(|s| strip_ansi(s)).max().unwrap_or(0);
+        let max_io_len = state.disk_io_nodes.iter().map(|s| strip_ansi(s)).max().unwrap_or(0);
+
+        if max_cap_len + 3 + max_io_len <= max_w as usize {
+            if row < max_h {
+                stdout.queue(cursor::MoveTo(0, row))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mStorage Heat-Map\x1b[0m"))?;
+                row += 1;
+            }
+            print_line(&mut row, &state.disk_combined_parent, &mut stdout)?;
+            combined_disk_nodes.clear();
+            for i in 0..state.disk_cap_nodes.len() {
+                let cap = &state.disk_cap_nodes[i];
+                let io = &state.disk_io_nodes[i];
+                let pad = " ".repeat(max_cap_len.saturating_sub(strip_ansi(cap)));
+                combined_disk_nodes.push(format!("{}{} | {}", cap, pad, io));
+            }
+            print_aligned_2col_grid(&mut row, &combined_disk_nodes, max_w as usize, &mut stdout)?;
+        } else {
+            if row < max_h {
+                stdout.queue(cursor::MoveTo(0, row))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mStorage Space Heat-Map\x1b[0m"))?;
+                row += 1;
+            }
+            print_line(&mut row, &state.disk_cap_parent, &mut stdout)?;
+            print_aligned_2col_grid(&mut row, &state.disk_cap_nodes, max_w as usize, &mut stdout)?;
+
+            if row < max_h {
+                stdout.queue(cursor::MoveTo(0, row))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mStorage \x1b[1m↓↑\x1b[0m \x1b[1;38;2;255;215;0mHeat-Map\x1b[0m"))?;
+                row += 1;
+            }
+            print_line(&mut row, &state.disk_io_parent, &mut stdout)?;
+            print_aligned_2col_grid(&mut row, &state.disk_io_nodes, max_w as usize, &mut stdout)?;
         }
 
-        stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
+        // Draw the very last horizontal border precisely at `max_h - 1` without executing ClearType::UntilNewLine.
+        // Also subtract 1 from max_w specifically for the last line to prevent the terminal from automatically
+        // shifting the buffer down and spawning an invisible row when the cursor hits the absolute bottom-right cell.
+        if row < max_h {
+            stdout.queue(cursor::MoveTo(0, row))?;
+            if row == max_h - 1 {
+                write!(stdout, "{}", "-".repeat((max_w as usize).saturating_sub(1)))?;
+            } else {
+                write!(stdout, "{}", "-".repeat(max_w as usize))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+            }
+            row += 1; // ensure row correctly tracks location
+        }
+
+        // Safely wipe out any old terminal garbage from resizing ONLY on lines strictly beneath the actual rendered content
+        if row < max_h {
+            stdout.queue(cursor::MoveTo(0, row))?;
+            stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
+        }
+
         stdout.flush()?;
         thread::sleep(Duration::from_millis(50));
     }

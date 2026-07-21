@@ -1,11 +1,12 @@
 [package]
 name = "cpu_grid"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2024"
 
 [dependencies]
 crossterm = "0.29.0"
 which = "6.0"
+libc = "0.2"
 
 [profile.release]
 # Aggressive optimizations
