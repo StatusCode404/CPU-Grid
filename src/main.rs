@@ -82,6 +82,7 @@ enum Msg {
         disk_combined_parent: String,
         disk_cap_nodes: Vec<String>,
         disk_io_nodes: Vec<String>,
+        disk_mounts: Vec<String>,
     },
     UserIdle(Duration),
 }
@@ -104,6 +105,7 @@ struct SystemState {
     disk_combined_parent: String,
     disk_cap_nodes: Vec<String>,
     disk_io_nodes: Vec<String>,
+    disk_mounts: Vec<String>,
     idle_time: Duration,
 }
 
@@ -141,6 +143,7 @@ fn print_help() {
     println!("\nColor Legend (Color shade gradually changes between the ranges defined underneath):");
     println!("  CPU Freq:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-100%) -> {vio}Violet{rst}(>100% overclock)");
     println!("  RAM Load:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-95%) -> {vio}Violet{rst}(>=95%)");
+    println!("                  (Used and Available values share the same color to indicate total memory pressure)");
     println!("  Swap Load:      {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-80%) -> {red}Hot Red{rst}(80-90%) -> {vio}Violet{rst}(>=90%)");
     println!("  Network Load:   {grn}Green{rst}(Low) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Hot Red{rst}(Near Interface Max) -> {vio}Violet{rst}(Exceeds Theoretical)");
     println!("  Storage Space:  {grn}Green{rst}(0-75%) -> {yel}Yellow{rst}(75-85%) -> {org}Orange{rst}(85-90%) -> {red}Hot Red{rst}(90-95%) -> {vio}Violet{rst}(>=95%)");
@@ -410,7 +413,7 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<TempStat>)> {
             if !name.trim().contains("k10temp") && !name.trim().contains("coretemp") { continue; }
 
             let parent_name = name.trim().to_string();
-            let mut chiplet_parts = Vec::with_capacity(16);
+            let mut chiplet_parts = Vec::new();
 
             for file in fs::read_dir(&path).into_iter().flatten().flatten() {
                 let fname = file.file_name().to_string_lossy().into_owned();
@@ -802,7 +805,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }).unwrap();
 
-    // --- Storage Telemetry Prototype Thread (v3.0.0) ---
+    // --- Storage Telemetry Thread (v3.0.0) ---
+    // Architecture: Uses `libc::statvfs` via C-bindings to calculate partition space safely.
+    // Disk Throughput is handled in 100% safe, pure Rust via /proc/diskstats natively.
     let tx_disk = tx.clone();
     thread::Builder::new().name("cg-disk".to_string()).spawn(move || {
         let mut prev_disk_stats: HashMap<String, (u64, u64, Instant)> = HashMap::with_capacity(16);
@@ -813,6 +818,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut dev_traffic: HashMap<String, (f64, f64)> = HashMap::with_capacity(16);
         let mut disk_cap_nodes = Vec::with_capacity(16);
         let mut disk_io_nodes = Vec::with_capacity(16);
+        let mut disk_mounts = Vec::with_capacity(16);
         let mut hw_trackers: HashMap<String, HrHwState> = HashMap::with_capacity(16);
         let mut global_hw = HrHwState::new();
         let mut active_devs = HashSet::with_capacity(16);
@@ -825,6 +831,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dev_traffic.clear();
             disk_cap_nodes.clear();
             disk_io_nodes.clear();
+            disk_mounts.clear();
             active_devs.clear();
             mounts_str.clear();
             diskstats_str.clear();
@@ -929,8 +936,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let capacity_color = get_disk_capacity_color(percent, is_cow);
                 if percent >= (if is_cow { 0.85 } else { 0.95 }) { force_violet_parent = true; }
 
-                disk_cap_nodes.push(format!(" {:<width$}: {color}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
-                    mount, format_size(used_bytes), format_size(total_bytes), color=capacity_color, width=max_mount_len
+                let mount_padded = format!(" {:<width$}: ", mount, width=max_mount_len);
+                disk_mounts.push(mount_padded.clone());
+
+                // Emulates 2-col UI: Left side receives Space string, Right side receives Speed string.
+                disk_cap_nodes.push(format!("{mount_padded}{color}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[1;38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
+                    format_size(used_bytes), format_size(total_bytes), color=capacity_color
                 ));
 
                 let r_color = get_exp_disk_speed_color(*r_speed, hw.current_r);
@@ -985,7 +996,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if tx_disk.send(Msg::DiskStats {
                 disk_cap_parent, disk_io_parent, disk_combined_parent,
-                disk_cap_nodes: disk_cap_nodes.clone(), disk_io_nodes: disk_io_nodes.clone()
+                disk_cap_nodes: disk_cap_nodes.clone(), disk_io_nodes: disk_io_nodes.clone(), disk_mounts: disk_mounts.clone()
             }).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(disk_interval));
         }
@@ -1015,11 +1026,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         disk_combined_parent: "Loading...".into(),
         disk_cap_nodes: vec![],
         disk_io_nodes: vec![],
+        disk_mounts: vec![],
         idle_time: Duration::ZERO,
     };
 
     // Pre-allocated UI Render Buffer array to prevent heap fragmentations when rendering Dynamic Layout 2-col grids.
     let mut combined_disk_nodes = Vec::with_capacity(16);
+    let mut split_io_nodes = Vec::with_capacity(16);
 
     loop {
         if event::poll(Duration::from_millis(10))? {
@@ -1081,12 +1094,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.net_total_str = format!("\x1b[1m{:>width$}:\x1b[0m {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
                         "Net Total", total_rx_col, format_net_speed(total_rx), total_tx_col, format_net_speed(total_tx), width=align_len);
                 },
-                Msg::DiskStats { disk_cap_parent, disk_io_parent, disk_combined_parent, disk_cap_nodes, disk_io_nodes } => {
+                Msg::DiskStats { disk_cap_parent, disk_io_parent, disk_combined_parent, disk_cap_nodes, disk_io_nodes, disk_mounts } => {
                     state.disk_cap_parent = disk_cap_parent;
                     state.disk_io_parent = disk_io_parent;
                     state.disk_combined_parent = disk_combined_parent;
                     state.disk_cap_nodes = disk_cap_nodes;
                     state.disk_io_nodes = disk_io_nodes;
+                    state.disk_mounts = disk_mounts;
                 },
                 Msg::NetEvent(iface, event_str) => { state.net_events.insert(iface, (event_str, Instant::now())); },
                 Msg::UserIdle(d) => state.idle_time = d,
@@ -1301,7 +1315,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 row += 1;
             }
             print_line(&mut row, &state.disk_io_parent, &mut stdout)?;
-            print_aligned_2col_grid(&mut row, &state.disk_io_nodes, max_w as usize, &mut stdout)?;
+            split_io_nodes.clear();
+            for i in 0..state.disk_io_nodes.len() {
+                let io = &state.disk_io_nodes[i];
+                let mount = state.disk_mounts.get(i).map(|s| s.as_str()).unwrap_or("");
+                split_io_nodes.push(format!("{}{}", mount, io));
+            }
+            print_aligned_2col_grid(&mut row, &split_io_nodes, max_w as usize, &mut stdout)?;
         }
 
         // Draw the very last horizontal border precisely at `max_h - 1` without executing ClearType::UntilNewLine.
