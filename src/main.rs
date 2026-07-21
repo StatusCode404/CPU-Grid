@@ -22,9 +22,16 @@ const MIN_CELL_WIDTH: usize = 17; // Reduced to allow tighter horizontal grid sq
 
 // --- Data Structures ---
 
+struct TempStat {
+    label: String,
+    val: f64,
+    color: String,
+    is_parent: bool,
+}
+
 enum Msg {
     CpuFreqs(Vec<f64>),
-    CpuTemps(Vec<(String, Vec<String>)>), // (Parent CPU/Adapter, Vec of formatted Chiplet strings)
+    CpuTemps(Vec<(String, Vec<TempStat>)>), // Parent CPU/Adapter, Vec of Chiplet data
     RoomTemp(String),
     MemStats {
         ram_str: String,
@@ -41,7 +48,7 @@ struct SystemState {
     cpu_model_display: String,
     limits: (Option<f64>, Option<f64>),
     freqs: Vec<f64>,
-    cpu_temps: Vec<(String, Vec<String>)> ,
+    cpu_temps: Vec<(String, Vec<TempStat>)>,
     room_temp: String,
     mem_ram_str: String,
     mem_zswap_str: String,
@@ -314,8 +321,8 @@ fn is_virtual_machine() -> bool {
     false
 }
 
-fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
-    let mut cpu_groups: HashMap<String, Vec<String>> = HashMap::new();
+fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<TempStat>)> {
+    let mut cpu_groups: HashMap<String, Vec<TempStat>> = HashMap::new();
 
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
@@ -352,32 +359,31 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
                 let label = fs::read_to_string(path.join(fname.replace("_input", "_label")))
                     .unwrap_or_else(|_| fname.replace("_input", "")).trim().to_string();
 
-                chiplet_parts.push((label, input_val / 1000.0, color));
+                let is_parent = label.contains("Tctl") || label.contains("Package") || label.contains("Tdie");
+
+                chiplet_parts.push(TempStat {
+                    label,
+                    val: input_val / 1000.0,
+                    color,
+                    is_parent,
+                });
             }
 
             if !chiplet_parts.is_empty() {
                 chiplet_parts.sort_by(|a, b| {
-                    let a_is_parent = a.0.contains("Tctl") || a.0.contains("Package") || a.0.contains("Tdie");
-                    let b_is_parent = b.0.contains("Tctl") || b.0.contains("Package") || b.0.contains("Tdie");
-                    b_is_parent.cmp(&a_is_parent).then(a.0.cmp(&b.0))
+                    b.is_parent.cmp(&a.is_parent).then(a.label.cmp(&b.label))
                 });
 
-                let formatted_chiplets: Vec<String> = chiplet_parts.into_iter().map(|(label, val, color)| {
-                    let is_parent = label.contains("Tctl") || label.contains("Package") || label.contains("Tdie");
-                    let font_weight = if is_parent { "\x1b[1m" } else { "" };
-                    format!("{}{}: {}{:.1}°C\x1b[0m", font_weight, label, color, val)
-                }).collect();
-
-                cpu_groups.insert(parent_name, formatted_chiplets);
+                cpu_groups.insert(parent_name, chiplet_parts);
             }
         }
     }
 
     if cpu_groups.is_empty() {
         let default_val = if is_vm {
-            "\x1b[38;2;255;165;0mN/A (VM Guest)\x1b[0m".to_string()
+            TempStat { label: "VM".to_string(), val: 0.0, color: "\x1b[38;2;255;165;0m".to_string(), is_parent: true }
         } else {
-            "\x1b[38;2;255;0;0mN/A\x1b[0m".to_string()
+            TempStat { label: "N/A".to_string(), val: 0.0, color: "\x1b[38;2;255;0;0m".to_string(), is_parent: true }
         };
         vec![("CPU Temps".to_string(), vec![default_val])]
     } else {
@@ -649,8 +655,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let swap_percent = if size > 0 { used as f64 / size as f64 } else { 0.0 };
                    
                     let col = get_swap_color(swap_percent);
-                    // Child nodes formatting hoisted directly into the background thread to prevent massive UI loop string allocations
-                    swap_devices_formatted.push(format!("{}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
+                    // Child nodes formatted with a leading space for clean 1-character indentation under Swap parent line
+                    swap_devices_formatted.push(format!(" {}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
                         p[0].split('/').last().unwrap_or("swap"),
                         format_size(used),
                         format_size(size),
@@ -662,7 +668,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let total_swap_percent = if total_swap > 0 { total_swap_used as f64 / total_swap as f64 } else { 0.0 };
             let swap_col = get_swap_color(total_swap_percent);
             let swap_total_str = format!(
-                "{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {cya}\x1b[1m{}\x1b[0m {wb_total_parent} | {col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
+                "{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {cya}{}\x1b[0m {wb_total_parent} | {col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
                 format_size(total_swap_used), format_size(total_swap), total_swap_percent * 100.0, col=swap_col, wb_used_parent=wb_used_parent, wb_total_parent=wb_total_parent, cya=cyan_bold
             );
 
@@ -956,6 +962,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let version = env!("CARGO_PKG_VERSION");
         print_line(&mut row, &format!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
         print_line(&mut row, &format!("\x1b[1m{}\x1b[0m", state.cpu_model_display), &mut stdout)?;
+        print_line(&mut row, "\x1b[1;35mType 'Q' or Ctrl+C to quit.\x1b[0m", &mut stdout)?;
 
         match state.limits {
             (Some(min), Some(max)) => print_line(&mut row, &format!("\x1b[1mHardware Limits:\x1b[0m \x1b[1;38;2;100;255;100m{:.0}\x1b[0m MHz Min | \x1b[1;38;2;255;0;0m{:.0}\x1b[0m MHz Max", min, max), &mut stdout)?,
@@ -966,8 +973,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        print_line(&mut row, &format!("\x1b[1mRoom Temp:\x1b[0m {}", state.room_temp), &mut stdout)?;
-
         let idle_secs = state.idle_time.as_secs();
         if idle_secs < 5 {
             print_line(&mut row, &format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m\x1b[38;2;0;255;255mACTIVE\x1b[0m"), &mut stdout)?;
@@ -975,23 +980,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_line(&mut row, &format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m{}IDLE {}\x1b[0m", get_idle_color(idle_secs), format_idle_time(idle_secs)), &mut stdout)?;
         }
 
-        // Render Dynamic CPU Temps
-        for (parent, chiplets) in &state.cpu_temps {
-            if chiplets.len() > 4 {
-                print_line(&mut row, &format!("\x1b[1mCPU Temps ({}):\x1b[0m", parent), &mut stdout)?;
-                let cols = (max_w as usize / MIN_CELL_WIDTH).max(1).min(chiplets.len().max(1));
-               
-                // Directly iterate chunks without creating a new heap-allocated Vec collection
-                for chunk in chiplets.chunks(cols) {
-                    let line = chunk.join(" | ");
-                    print_line(&mut row, &line, &mut stdout)?;
-                }
-            } else {
-                print_line(&mut row, &format!("\x1b[1mCPU Temps:\x1b[0m {}", chiplets.join(" | ")), &mut stdout)?;
-            }
+        if row < max_h - 1 {
+            stdout.queue(cursor::MoveTo(0, row))?;
+            stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+            write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mTemperature Heat-Map\x1b[0m"))?;
+            row += 1;
         }
 
-        print_line(&mut row, "\x1b[1;35mType 'Q' or Ctrl+C to quit.\x1b[0m", &mut stdout)?;
+        print_line(&mut row, &format!("\x1b[1mRoom Temp:\x1b[0m {}", state.room_temp), &mut stdout)?;
+
+        // Render Dynamic CPU Temps
+        for (parent, chiplets) in &state.cpu_temps {
+            if chiplets.is_empty() { continue; }
+            print_line(&mut row, &format!("\x1b[1mCPU Temps ({}):\x1b[0m", parent), &mut stdout)?;
+           
+            let cols = (max_w as usize / MIN_CELL_WIDTH).max(1).min(chiplets.len().max(1));
+            let temp_rows = (chiplets.len() + cols - 1) / cols;
+           
+            // Calculate longest label dynamically to right-justify temp labels perfectly like Core Heat-Map
+            let max_lbl = chiplets.iter().map(|c| c.label.len()).max().unwrap_or(4).max(4);
+
+            for r in 0..temp_rows {
+                if row >= max_h - 1 { break; }
+                stdout.queue(cursor::MoveTo(0, row))?;
+                stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+                for c in 0..cols {
+                    let idx = r * cols + c;
+                    if idx < chiplets.len() {
+                        let stat = &chiplets[idx];
+                        let sep = if c < cols - 1 { " | " } else { "" };
+                        let fw = if stat.is_parent { "\x1b[1m" } else { "" };
+                        // Forces 4-character temp reading (e.g. 45.0) and exactly aligned labels
+                        write!(stdout, "{}{:>width$}: {}{:4.1}°C\x1b[0m{}", fw, stat.label, stat.color, stat.val, sep, width=max_lbl)?;
+                    }
+                }
+                row += 1;
+            }
+        }
 
         let core_msg = if state.freqs.is_empty() {
             "Error: Core Frequencies cannot be accessed"
@@ -1004,7 +1029,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if row < max_h - 1 {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", get_dashed_line(max_w as usize, &format!("\x1b[1m{}\x1b[0m", core_msg)))?;
+            write!(stdout, "{}", get_dashed_line(max_w as usize, &format!("\x1b[1;38;2;255;215;0m{}\x1b[0m", core_msg)))?;
             row += 1;
         }
 
@@ -1039,7 +1064,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if row < max_h - 1 {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", "-".repeat(max_w as usize))?;
+            write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mMemory Heat-Map\x1b[0m"))?;
             row += 1;
         }
 
@@ -1051,11 +1076,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Send swap array through the self-aligning 2-col renderer
         print_aligned_2col_grid(&mut row, &state.swaps_formatted, max_w as usize, &mut stdout)?;
 
+        if row < max_h - 1 {
+            stdout.queue(cursor::MoveTo(0, row))?;
+            stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+            write!(stdout, "{}", get_dashed_line(max_w as usize, "\x1b[1;38;2;255;215;0mNetwork Heat-Map\x1b[0m"))?;
+            row += 1;
+        }
+
         // --- Network Grid Formatting ---
         print_line(&mut row, &state.net_total_str, &mut stdout)?;
        
         // Send network array through the self-aligning 2-col renderer
         print_aligned_2col_grid(&mut row, &state.net_stats, max_w as usize, &mut stdout)?;
+       
+        if row < max_h - 1 {
+            stdout.queue(cursor::MoveTo(0, row))?;
+            stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
+            write!(stdout, "{}", "-".repeat(max_w as usize))?;
+        }
 
         stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
         stdout.flush()?;
