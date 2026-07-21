@@ -18,16 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_INTERVAL: f64 = 2.0;
-const MIN_CELL_WIDTH: usize = 16; // Reduced to allow tighter horizontal grid squeezing
+const MIN_CELL_WIDTH: usize = 17; // Reduced to allow tighter horizontal grid squeezing
 
 // --- Data Structures ---
-
-struct SwapStat {
-    name: String,
-    used: u64,
-    size: u64,
-    percent: f64,
-}
 
 enum Msg {
     CpuFreqs(Vec<f64>),
@@ -37,7 +30,7 @@ enum Msg {
         ram_str: String,
         zswap_str: String,
         swap_total_str: String,
-        swaps: Vec<SwapStat>,
+        swaps_formatted: Vec<String>, // Formatted in background thread to prevent UI heap fragmentation
     },
     NetStats(Vec<(String, f64, f64, f64)>), // Interface, Rx Speed, Tx Speed, Max Speed
     NetEvent(String, String),               // Interface Name, Event String (ACTIVATED/DEACTIVATED)
@@ -45,15 +38,15 @@ enum Msg {
 }
 
 struct SystemState {
-    cpu_model: String,
+    cpu_model_display: String,
     limits: (Option<f64>, Option<f64>),
     freqs: Vec<f64>,
-    cpu_temps: Vec<(String, Vec<String>)>,
+    cpu_temps: Vec<(String, Vec<String>)> ,
     room_temp: String,
     mem_ram_str: String,
     mem_zswap_str: String,
     mem_swap_total_str: String,
-    swaps: Vec<SwapStat>,
+    swaps_formatted: Vec<String>,
     net_total_str: String,
     net_stats: Vec<String>,
     net_events: HashMap<String, (String, Instant)>,
@@ -128,9 +121,10 @@ fn format_size(kb: u64) -> String {
     }
 }
 
+// Ensures all speed strings are exactly 11 characters long for perfect arrow vertical alignment
 fn format_net_speed(bytes_per_sec: f64) -> String {
     if bytes_per_sec < 1024.0 {
-        format!("{:6.1} B/s", bytes_per_sec)
+        format!("{:6.1}  B/s", bytes_per_sec) // Extra space injected to match 5-char width of " KB/s"
     } else if bytes_per_sec < 1024.0 * 1024.0 {
         format!("{:6.1} KB/s", bytes_per_sec / 1024.0)
     } else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 {
@@ -525,13 +519,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let is_vm = is_virtual_machine();
 
-    let cpu_model = fs::read_to_string("/proc/cpuinfo")
+    let cpu_model_raw = fs::read_to_string("/proc/cpuinfo")
         .unwrap_or_default()
         .lines()
         .find(|l| l.starts_with("model name") || l.starts_with("Processor") || l.starts_with("Hardware"))
         .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().to_string())
         .unwrap_or("Unknown".into());
+
+    // Formatted once strictly outside the 50ms loop to prevent constant String allocations
+    let cpu_model_display = cpu_model_raw
+        .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m")
+        .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m")
+        .replace("Apple", "\x1b[1;38;2;192;192;192mApple\x1b[0m\x1b[1m")
+        .replace("ARM", "\x1b[1;38;2;0;193;222mARM\x1b[0m\x1b[1m")
+        .replace("RISC-V", "\x1b[1;38;2;155;81;224mRISC-V\x1b[0m\x1b[1m")
+        .replace("IBM", "\x1b[1;38;2;31;112;193mIBM\x1b[0m\x1b[1m");
 
     let limits = (
         fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq")
@@ -544,7 +547,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|k| k / 1000.0),
     );
 
-    let (tx, rx) = mpsc::channel::<Msg>();
+    // MPSC Bound ensures memory fragmentation prevention by capping active nodes on the heap
+    let (tx, rx) = mpsc::sync_channel::<Msg>(32);
 
     // 1. CPU Thread - Buffer is instantiated ONCE outside the loop to prevent memory bloat over uptime.
     let tx_cpu = tx.clone();
@@ -619,21 +623,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ram_percent = if total > 0 { used as f64 / total as f64 } else { 0.0 };
             let mem_color = get_ram_color(ram_percent);
 
-            let wb_used = "\x1b[1;37mUsed\x1b[0m";
-            let wb_avail = "\x1b[1;37mAvail\x1b[0m";
-            let wb_total = "\x1b[1;37mTotal\x1b[0m";
-            let cyan_color = "\x1b[38;2;0;255;255m";
+            let wb_used_parent = "\x1b[1;37mUsed\x1b[0m";
+            let wb_avail_parent = "\x1b[1;37mAvail\x1b[0m";
+            let wb_total_parent = "\x1b[1;37mTotal\x1b[0m";
+            let cyan_bold = "\x1b[1;38;2;0;255;255m";
 
             let ram_str = format!(
-                "{col}\x1b[1m{}\x1b[0m {wb_used} | {col}\x1b[1m{}\x1b[0m {wb_avail} | {cya}\x1b[1m{}\x1b[0m {wb_total}",
-                format_size(used), format_size(avail), format_size(total), col=mem_color, wb_used=wb_used, wb_avail=wb_avail, cya=cyan_color
+                "{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {col}\x1b[1m{}\x1b[0m {wb_avail_parent} | {cya}{}\x1b[0m {wb_total_parent}",
+                format_size(used), format_size(avail), format_size(total), col=mem_color, wb_used_parent=wb_used_parent, wb_avail_parent=wb_avail_parent, cya=cyan_bold
             );
 
             swap_buf.clear();
             if let Ok(mut file) = File::open("/proc/swaps") { let _ = file.read_to_string(&mut swap_buf); }
             let mut total_swap = 0u64;
             let mut total_swap_used = 0u64;
-            let mut swap_devices = Vec::new();
+            let mut swap_devices_formatted = Vec::new();
 
             for line in swap_buf.lines().skip(1) {
                 let p: Vec<&str> = line.split_whitespace().collect();
@@ -643,21 +647,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     total_swap += size;
                     total_swap_used += used;
                     let swap_percent = if size > 0 { used as f64 / size as f64 } else { 0.0 };
-
-                    swap_devices.push(SwapStat {
-                        name: p[0].split('/').last().unwrap_or("swap").to_string(),
-                        used,
-                        size,
-                        percent: swap_percent
-                    });
+                   
+                    let col = get_swap_color(swap_percent);
+                    // Child nodes formatting hoisted directly into the background thread to prevent massive UI loop string allocations
+                    swap_devices_formatted.push(format!("{}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / \x1b[38;2;0;255;255m{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
+                        p[0].split('/').last().unwrap_or("swap"),
+                        format_size(used),
+                        format_size(size),
+                        col=col
+                    ));
                 }
             }
 
             let total_swap_percent = if total_swap > 0 { total_swap_used as f64 / total_swap as f64 } else { 0.0 };
             let swap_col = get_swap_color(total_swap_percent);
             let swap_total_str = format!(
-                "{col}\x1b[1m{}\x1b[0m {wb_used} | {cya}\x1b[1m{}\x1b[0m {wb_total} | {col}\x1b[1m{:.1}%\x1b[0m \x1b[1;37m%Used\x1b[0m",
-                format_size(total_swap_used), format_size(total_swap), total_swap_percent * 100.0, col=swap_col, wb_used=wb_used, wb_total=wb_total, cya=cyan_color
+                "{col}\x1b[1m{}\x1b[0m {wb_used_parent} | {cya}\x1b[1m{}\x1b[0m {wb_total_parent} | {col}\x1b[1m{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
+                format_size(total_swap_used), format_size(total_swap), total_swap_percent * 100.0, col=swap_col, wb_used_parent=wb_used_parent, wb_total_parent=wb_total_parent, cya=cyan_bold
             );
 
             let zswap_param_path = std::path::Path::new("/sys/module/zswap/parameters/enabled");
@@ -683,7 +689,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let algo_trim = algo.trim();
                                     let algo_color = get_zswap_algo_color(algo_trim);
 
-                                    // All Zswap metric values explicitly formatted with \x1b[1m (Bold)
                                     format!(
                                         "\x1b[38;2;0;200;0m\x1b[1mEnabled\x1b[0m | \x1b[1mAlgo:\x1b[0m {algo_color}\x1b[1m{algo_trim}\x1b[0m | \x1b[1mPool:\x1b[0m {pool_color}\x1b[1m{}\x1b[0m | \x1b[1mRatio:\x1b[0m {ratio_color}\x1b[1m{:.1}:1\x1b[0m",
                                         format_size(pool / 1024), ratio
@@ -703,7 +708,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ram_str,
                 zswap_str,
                 swap_total_str,
-                swaps: swap_devices
+                swaps_formatted: swap_devices_formatted, // Forward pure pre-formatted strings
             }).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(mem_interval));
         }
@@ -713,9 +718,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tx_net = tx.clone();
     thread::Builder::new().name("cg-net".to_string()).spawn(move || {
         let mut prev_stats: HashMap<String, (u64, u64, Instant)> = HashMap::new();
+        // Variables hoisted out of the loop to prevent repeated allocations/drops over long uptimes
+        let mut current_stats = Vec::with_capacity(8);
+        let mut current_keys = HashSet::with_capacity(8);
+       
         loop {
-            let mut current_stats = Vec::new();
-            let mut current_keys = HashSet::new();
+            current_stats.clear();
+            current_keys.clear();
             let now = Instant::now();
 
             if let Ok(dev_str) = fs::read_to_string("/proc/net/dev") {
@@ -760,7 +769,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for rm in to_remove { prev_stats.remove(&rm); }
 
-            if tx_net.send(Msg::NetStats(current_stats)).is_err() { break; }
+            if tx_net.send(Msg::NetStats(current_stats.clone())).is_err() { break; }
             thread::sleep(Duration::from_secs_f64(net_interval));
         }
     }).unwrap();
@@ -781,7 +790,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stdout.queue(terminal::Clear(ClearType::All))?;
 
     let mut state = SystemState {
-        cpu_model,
+        cpu_model_display,
         limits,
         freqs: vec![],
         cpu_temps: vec![],
@@ -789,7 +798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mem_ram_str: "Loading...".into(),
         mem_zswap_str: "Loading...".into(),
         mem_swap_total_str: "Loading...".into(),
-        swaps: vec![],
+        swaps_formatted: vec![],
         net_total_str: "Loading...".into(),
         net_stats: vec![],
         net_events: HashMap::new(),
@@ -808,22 +817,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Process message queue natively.
+        // This transfers pre-formatted strings directly into the render state, shielding the 50ms UI loop from runtime memory allocation logic.
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 Msg::CpuFreqs(f) => state.freqs = f,
                 Msg::CpuTemps(t) => state.cpu_temps = t,
                 Msg::RoomTemp(r) => state.room_temp = r,
-                Msg::MemStats { ram_str, zswap_str, swap_total_str, swaps } => {
+                Msg::MemStats { ram_str, zswap_str, swap_total_str, swaps_formatted } => {
                     state.mem_ram_str = ram_str;
                     state.mem_zswap_str = zswap_str;
                     state.mem_swap_total_str = swap_total_str;
-                    state.swaps = swaps;
+                    state.swaps_formatted = swaps_formatted;
                 }
                 Msg::NetStats(n) => {
                     let mut total_rx = 0.0;
                     let mut total_tx = 0.0;
                     let mut total_max = 0.0;
-                    let mut net_nodes = Vec::new();
+                   
+                    // Reusable buffer to prevent loop leaks
+                    let mut net_nodes = Vec::with_capacity(n.len() + state.net_events.len());
 
                     let align_len = 9.max(n.iter().map(|(iface, _, _, _)| iface.len()).max().unwrap_or(0));
 
@@ -842,10 +855,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let rx_col = get_net_color(*rx_speed, *max_bytes);
                         let tx_col = get_net_color(*tx_speed, *max_bytes);
+                       
+                        let rx_str = format_net_speed(*rx_speed);
+                        let tx_str = format_net_speed(*tx_speed);
+                       
                         net_nodes.push(format!("{:>width$}: {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
                             iface,
-                            rx_col, format_net_speed(*rx_speed),
-                            tx_col, format_net_speed(*tx_speed),
+                            rx_col, rx_str,
+                            tx_col, tx_str,
                             width=align_len
                         ));
                     }
@@ -873,6 +890,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Msg::UserIdle(d) => state.idle_time = d,
             }
         }
+       
+        // Purge expired events. Protects against HashMap heap fragmentation bloat over extensive uptime periods.
+        state.net_events.retain(|_, (_, time)| time.elapsed().as_secs() < 5);
 
         let (max_w, max_h) = terminal::size()?;
         if max_w < MIN_CELL_WIDTH as u16 {
@@ -886,7 +906,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout.queue(cursor::MoveTo(0, 0))?;
         let mut row = 0;
 
-        let print_line = |row: &mut u16, text: String, stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
+        // Passed as `&str` reference specifically to guarantee zero-heap allocations inside the 50ms (20fps) UI rendering loop.
+        let print_line = |row: &mut u16, text: &str, stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
             if *row < max_h {
                 stdout.queue(cursor::MoveTo(0, *row))?;
                 write!(stdout, "{}", text)?;
@@ -896,54 +917,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
+        // Standardized 2-Column Grid Renderer for dynamic UI layouts.
+        let print_aligned_2col_grid = |row: &mut u16, items: &[String], max_w: usize, stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
+            // First, calculate the longest column 1 width purely for this specific grid array to prevent global alignment bleed.
+            let mut col1_w = 0;
+            let mut check_idx = 0;
+            while check_idx < items.len() {
+                let len = strip_ansi(&items[check_idx]);
+                if len > col1_w { col1_w = len; }
+                check_idx += 2;
+            }
+
+            let mut i = 0;
+           
+            while i < items.len() {
+                let item1 = &items[i];
+                let len1 = strip_ansi(item1);
+
+                if i + 1 < items.len() {
+                    let item2 = &items[i+1];
+                    let len2 = strip_ansi(item2);
+
+                    // If combining both items doesn't exceed terminal width limits, place side-by-side.
+                    if col1_w + 3 + len2 <= max_w {
+                        let pad = " ".repeat(col1_w.saturating_sub(len1));
+                        print_line(row, &format!("{}{} | {}", item1, pad, item2), stdout)?;
+                        i += 2;
+                        continue;
+                    }
+                }
+                print_line(row, item1, stdout)?;
+                i += 1;
+            }
+            Ok(())
+        };
+
         // Render Dynamic Header Blocks
         let version = env!("CARGO_PKG_VERSION");
-        print_line(&mut row, format!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
-       
-        let cpu_model_display = state.cpu_model
-            .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m")
-            .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m")
-            .replace("Apple", "\x1b[1;38;2;192;192;192mApple\x1b[0m\x1b[1m")
-            .replace("ARM", "\x1b[1;38;2;0;193;222mARM\x1b[0m\x1b[1m")
-            .replace("RISC-V", "\x1b[1;38;2;155;81;224mRISC-V\x1b[0m\x1b[1m")
-            .replace("IBM", "\x1b[1;38;2;31;112;193mIBM\x1b[0m\x1b[1m");
-           
-        print_line(&mut row, format!("\x1b[1m{}\x1b[0m", cpu_model_display), &mut stdout)?;
+        print_line(&mut row, &format!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
+        print_line(&mut row, &format!("\x1b[1m{}\x1b[0m", state.cpu_model_display), &mut stdout)?;
 
         match state.limits {
-            (Some(min), Some(max)) => print_line(&mut row, format!("\x1b[1mHardware Limits:\x1b[0m \x1b[1;38;2;100;255;100m{:.0}\x1b[0m MHz Min | \x1b[1;38;2;255;0;0m{:.0}\x1b[0m MHz Max", min, max), &mut stdout)?,
+            (Some(min), Some(max)) => print_line(&mut row, &format!("\x1b[1mHardware Limits:\x1b[0m \x1b[1;38;2;100;255;100m{:.0}\x1b[0m MHz Min | \x1b[1;38;2;255;0;0m{:.0}\x1b[0m MHz Max", min, max), &mut stdout)?,
             _ => {
                 let msg = if is_vm { "\x1b[1mHardware Limits:\x1b[0m \x1b[38;2;255;165;0mVM detected, limits not exposed\x1b[0m" }
                 else { "\x1b[1mHardware Limits:\x1b[0m \x1b[38;2;255;0;0mUnavailable\x1b[0m" };
-                print_line(&mut row, msg.to_string(), &mut stdout)?;
+                print_line(&mut row, msg, &mut stdout)?;
             }
         }
 
-        print_line(&mut row, format!("\x1b[1mRoom Temp:\x1b[0m {}", state.room_temp), &mut stdout)?;
+        print_line(&mut row, &format!("\x1b[1mRoom Temp:\x1b[0m {}", state.room_temp), &mut stdout)?;
 
         let idle_secs = state.idle_time.as_secs();
         if idle_secs < 5 {
-            print_line(&mut row, format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m\x1b[38;2;0;255;255mACTIVE\x1b[0m"), &mut stdout)?;
+            print_line(&mut row, &format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m\x1b[38;2;0;255;255mACTIVE\x1b[0m"), &mut stdout)?;
         } else {
-            print_line(&mut row, format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m{}IDLE {}\x1b[0m", get_idle_color(idle_secs), format_idle_time(idle_secs)), &mut stdout)?;
+            print_line(&mut row, &format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m{}IDLE {}\x1b[0m", get_idle_color(idle_secs), format_idle_time(idle_secs)), &mut stdout)?;
         }
 
         // Render Dynamic CPU Temps
         for (parent, chiplets) in &state.cpu_temps {
             if chiplets.len() > 4 {
-                print_line(&mut row, format!("\x1b[1mCPU Temps ({}):\x1b[0m", parent), &mut stdout)?;
+                print_line(&mut row, &format!("\x1b[1mCPU Temps ({}):\x1b[0m", parent), &mut stdout)?;
                 let cols = (max_w as usize / MIN_CELL_WIDTH).max(1).min(chiplets.len().max(1));
-                let chunked_chiplets: Vec<&[String]> = chiplets.chunks(cols).collect();
-                for chunk in chunked_chiplets {
+               
+                // Directly iterate chunks without creating a new heap-allocated Vec collection
+                for chunk in chiplets.chunks(cols) {
                     let line = chunk.join(" | ");
-                    print_line(&mut row, line, &mut stdout)?;
+                    print_line(&mut row, &line, &mut stdout)?;
                 }
             } else {
-                print_line(&mut row, format!("\x1b[1mCPU Temps:\x1b[0m {}", chiplets.join(" | ")), &mut stdout)?;
+                print_line(&mut row, &format!("\x1b[1mCPU Temps:\x1b[0m {}", chiplets.join(" | ")), &mut stdout)?;
             }
         }
 
-        print_line(&mut row, "\x1b[1;35mType 'Q' or Ctrl+C to quit.\x1b[0m".to_string(), &mut stdout)?;
+        print_line(&mut row, "\x1b[1;35mType 'Q' or Ctrl+C to quit.\x1b[0m", &mut stdout)?;
 
         let core_msg = if state.freqs.is_empty() {
             "Error: Core Frequencies cannot be accessed"
@@ -956,7 +1004,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if row < max_h - 1 {
             stdout.queue(cursor::MoveTo(0, row))?;
             stdout.queue(terminal::Clear(ClearType::UntilNewLine))?;
-            write!(stdout, "{}", get_dashed_line(max_w as usize, format!("\x1b[1m{}\x1b[0m", core_msg).as_str()))?;
+            write!(stdout, "{}", get_dashed_line(max_w as usize, &format!("\x1b[1m{}\x1b[0m", core_msg)))?;
             row += 1;
         }
 
@@ -995,67 +1043,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             row += 1;
         }
 
-        // --- Memory & Swap Formatting ---
-        print_line(&mut row, format!("\x1b[1mRAM:\x1b[0m {}", state.mem_ram_str), &mut stdout)?;
-        print_line(&mut row, format!("\x1b[1mZswap:\x1b[0m {}", state.mem_zswap_str), &mut stdout)?;
-        print_line(&mut row, format!("\x1b[1mSwap:\x1b[0m {}", state.mem_swap_total_str), &mut stdout)?;
+        // --- Memory Formatting ---
+        print_line(&mut row, &format!("\x1b[1mRAM:\x1b[0m {}", state.mem_ram_str), &mut stdout)?;
+        print_line(&mut row, &format!("\x1b[1mZswap:\x1b[0m {}", state.mem_zswap_str), &mut stdout)?;
+        print_line(&mut row, &format!("\x1b[1mSwap:\x1b[0m {}", state.mem_swap_total_str), &mut stdout)?;
 
-        let mut swap_nodes = Vec::new();
-        for swap in &state.swaps {
-            let col = get_swap_color(swap.percent);
-            // Compact child swap representation: removed %Used key/value pair as requested
-            swap_nodes.push(format!("{}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / {col}{}\x1b[0m \x1b[0;37mTotal\x1b[0m",
-                swap.name,
-                format_size(swap.used),
-                format_size(swap.size),
-                col=col
-            ));
-        }
-
-        // --- Unified 2-Column Grid Alignment Logic ---
-        // Dynamically calculates the longest 1st column item across both Swap and Network nodes.
-        // Ensures the '|' divider aligns identically for both grids, with Column 2 left-justified 1 space from '|'.
-        let mut unified_col1_w = 0;
-        for grid_items in [&swap_nodes, &state.net_stats] {
-            let mut i = 0;
-            while i < grid_items.len() {
-                let len = strip_ansi(&grid_items[i]);
-                if len > unified_col1_w {
-                    unified_col1_w = len;
-                }
-                i += 2; // Column 1 candidates
-            }
-        }
-
-        let print_aligned_2col_grid = |row: &mut u16, items: &[String], stdout: &mut BufWriter<io::Stdout>| -> io::Result<()> {
-            let mut i = 0;
-            while i < items.len() {
-                let item1 = &items[i];
-                let len1 = strip_ansi(item1);
-
-                if i + 1 < items.len() {
-                    let item2 = &items[i+1];
-                    let len2 = strip_ansi(item2);
-
-                    // Check if combined column width fits within half or full terminal space
-                    if unified_col1_w + 3 + len2 <= max_w as usize {
-                        let pad = " ".repeat(unified_col1_w.saturating_sub(len1));
-                        print_line(row, format!("{}{} | {}", item1, pad, item2), stdout)?;
-                        i += 2;
-                        continue;
-                    }
-                }
-                print_line(row, item1.clone(), stdout)?;
-                i += 1;
-            }
-            Ok(())
-        };
-
-        print_aligned_2col_grid(&mut row, &swap_nodes, &mut stdout)?;
+        // Send swap array through the self-aligning 2-col renderer
+        print_aligned_2col_grid(&mut row, &state.swaps_formatted, max_w as usize, &mut stdout)?;
 
         // --- Network Grid Formatting ---
-        print_line(&mut row, state.net_total_str.clone(), &mut stdout)?;
-        print_aligned_2col_grid(&mut row, &state.net_stats, &mut stdout)?;
+        print_line(&mut row, &state.net_total_str, &mut stdout)?;
+       
+        // Send network array through the self-aligning 2-col renderer
+        print_aligned_2col_grid(&mut row, &state.net_stats, max_w as usize, &mut stdout)?;
 
         stdout.queue(terminal::Clear(ClearType::FromCursorDown))?;
         stdout.flush()?;
