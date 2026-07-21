@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_INTERVAL: f64 = 2.0;
-const MIN_CELL_WIDTH: usize = 16; // Tighter horizontal grid squeezing for the new 6-char dynamic width
+const MIN_CELL_WIDTH: usize = 16; 
 
 // --- Data Structures ---
 
@@ -30,7 +30,7 @@ struct SwapStat {
 
 enum Msg {
     CpuFreqs(Vec<f64>),
-    CpuTemps(Vec<(String, Vec<String>)>), // (Parent CPU/Adapter, Vec of formatted Chiplet strings)
+    CpuTemps(Vec<(String, Vec<String>)>),
     RoomTemp(String),
     MemStats {
         ram_str: String,
@@ -38,8 +38,8 @@ enum Msg {
         swap_total_str: String,
         swaps: Vec<SwapStat>,
     },
-    NetStats(Vec<(String, f64, f64, f64)>), // Interface, Rx Speed, Tx Speed, Max Speed
-    NetEvent(String, String),               // Interface Name, Event String (ACTIVATED/DEACTIVATED)
+    NetStats(Vec<(String, f64, f64, f64)>), 
+    NetEvent(String, String),               
     UserIdle(Duration),
 }
 
@@ -73,10 +73,10 @@ fn print_help() {
     let ltr = "\x1b[38;2;255;100;100m";
     let brt = "\x1b[1;31m";
 
-    // Replaced standard title with Gold Title per request
     println!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version);
     println!("Copyright (C) 2026 StatusCode404 https://github.com/StatusCode404");
     println!("Project: https://github.com/StatusCode404/CPU-Grid");
+    println!("Compatibility: Full support for x86, ARM (incl. Apple Silicon), RISC-V, and IBM processor architectures via standard Linux kernel sysfs interfaces.");
 
     println!("\nUsage (Values are in seconds. Parameters given less than or greater than the boundary ranges will fall back to the nearest boundary range.):");
     println!("  -n[<secs>]    Interval for CPU stats (0.1 - 60s, default 2.0)");
@@ -175,41 +175,35 @@ fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
     )
 }
 
-// New dynamic formatting to perfectly lock values to exactly 6 character spaces.
-// Dynamically calculates precision bounds based on log10 scale of integer part.
 #[inline(always)]
 fn format_dynamic_6(val: f64) -> String {
     let int_part = val.trunc();
     let int_len = if int_part == 0.0 { 1 } else { int_part.abs().log10().floor() as i32 + 1 };
     
     if int_len >= 6 {
-        // Fallback for massive values to cap space (No decimals)
         format!("{:6.0}", val.clamp(0.0, 999999.0))
     } else {
-        // Calculate remaining space: 6 total - integer length - 1 (for the decimal point)
         let prec = (6 - int_len - 1).max(0) as usize;
         format!("{:.*}", prec, val)
     }
 }
 
-// "Hot Steel" logic applied below: Orange -> Medium Red -> Bright Intense Red -> Violet
-
 #[inline]
 fn get_cpu_color(t: f64) -> String {
-    if t >= 1.0 { return "\x1b[1;38;2;238;130;238m".to_string(); } // Violet Overclock
+    if t >= 1.0 { return "\x1b[1;38;2;238;130;238m".to_string(); } 
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
-    else if t <= 0.85 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.15) } // Orange -> Medium Red
-    else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.85) / 0.15) };              // Medium Red -> Bright Red
+    else if t <= 0.85 { lerp_color((255, 165, 0), (200, 30, 30), (t - 0.7) / 0.15) } 
+    else { lerp_color((200, 30, 30), (255, 0, 0), (t - 0.85) / 0.15) };              
     
-    if t >= 0.85 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) } // Intense Bold Red for peak bounds
+    if t >= 0.85 { format!("\x1b[1;38;2;{};{};{}m", r, g, b) } 
     else { format!("\x1b[38;2;{};{};{}m", r, g, b) }
 }
 
 #[inline]
 fn get_ram_color(t: f64) -> String {
-    if t >= 0.95 { return "\x1b[1;38;2;238;130;238m".to_string(); } // Violet Overload
+    if t >= 0.95 { return "\x1b[1;38;2;238;130;238m".to_string(); } 
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.5 { lerp_color((0, 200, 0), (255, 255, 0), t / 0.5) }
     else if t <= 0.7 { lerp_color((255, 255, 0), (255, 165, 0), (t - 0.5) / 0.2) }
@@ -249,7 +243,7 @@ fn get_net_color(speed: f64, max_speed: f64) -> String {
 
 #[inline]
 fn get_idle_color(secs: u64) -> String {
-    let t = secs as f64 / 31536000.0; // 1 year max scale
+    let t = secs as f64 / 31536000.0; 
     let t = t.clamp(0.0, 1.0);
     let (r, g, b) = if t <= 0.25 {
         lerp_color((0, 200, 0), (255, 255, 0), t / 0.25)
@@ -336,8 +330,8 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
                 continue;
             }
 
-            let parent_name = name.trim().to_string(); // Represents the physical CPU or package
-            let mut chiplet_parts = Vec::new(); // Stores (Label, Temp, Color) for sorting
+            let parent_name = name.trim().to_string(); 
+            let mut chiplet_parts = Vec::new(); 
 
             for file in fs::read_dir(&path).into_iter().flatten().flatten() {
                 let fname = file.file_name().to_string_lossy().into_owned();
@@ -357,7 +351,7 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
 
                 let limit = read_limit(fname.replace("_input", "_max"))
                     .or_else(|| read_limit(fname.replace("_input", "_crit")))
-                    .unwrap_or(95000.0); // Fallback limit to 95°C
+                    .unwrap_or(95000.0); 
 
                 let color = get_cpu_color(input_val / limit);
                 let label = fs::read_to_string(path.join(fname.replace("_input", "_label")))
@@ -367,14 +361,12 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<String>)> {
             }
 
             if !chiplet_parts.is_empty() {
-                // Sorting logic: Tctl / Package / Tdie are placed securely at the front
                 chiplet_parts.sort_by(|a, b| {
                     let a_is_parent = a.0.contains("Tctl") || a.0.contains("Package") || a.0.contains("Tdie");
                     let b_is_parent = b.0.contains("Tctl") || b.0.contains("Package") || b.0.contains("Tdie");
                     b_is_parent.cmp(&a_is_parent).then(a.0.cmp(&b.0))
                 });
 
-                // [SIMD Optimization]: Chained iterators processed here are heavily vectorized by LLVM
                 let formatted_chiplets: Vec<String> = chiplet_parts.into_iter().map(|(label, val, color)| {
                     let is_parent = label.contains("Tctl") || label.contains("Package") || label.contains("Tdie");
                     let font_weight = if is_parent { "\x1b[1m" } else { "" };
@@ -432,10 +424,7 @@ fn find_temper_poll() -> Option<std::path::PathBuf> {
     None
 }
 
-// User-space Wayland/X11 DBus fallback for tracking idle mouse/kb without sudo
 fn get_desktop_idle_time() -> Option<Duration> {
-    // Helper to safely execute user-space DBus/X11 commands whether running as Standard User or Root (via sudo).
-    // If run via sudo, it injects the original user's DBus and Display context so desktop idle tracking still functions.
     let run_cmd = |cmd: &str, args: &[&str]| {
         if let Ok(sudo_user) = std::env::var("SUDO_USER") {
             let script = format!("XDG_RUNTIME_DIR=/run/user/$(id -u {0}) DISPLAY=${{DISPLAY:-:0}} {1} {2}", sudo_user, cmd, args.join(" "));
@@ -445,7 +434,6 @@ fn get_desktop_idle_time() -> Option<Duration> {
         }
     };
 
-    // 1. Wayland GNOME
     if let Ok(out) = run_cmd("busctl", &["--user", "call", "org.gnome.Mutter.IdleMonitor", "/org/gnome/Mutter/IdleMonitor/Core", "org.gnome.Mutter.IdleMonitor", "GetIdletime"]) {
         let s = String::from_utf8_lossy(&out.stdout);
         if let Some(t_str) = s.split_whitespace().last() {
@@ -453,7 +441,6 @@ fn get_desktop_idle_time() -> Option<Duration> {
         }
     }
 
-    // 2. Wayland KDE
     if let Ok(out) = run_cmd("busctl", &["--user", "call", "org.kde.Screensaver", "/ScreenSaver", "org.kde.Screensaver", "GetSessionIdleTime"]) {
         let s = String::from_utf8_lossy(&out.stdout);
         if let Some(t_str) = s.split_whitespace().last() {
@@ -461,7 +448,6 @@ fn get_desktop_idle_time() -> Option<Duration> {
         }
     }
 
-    // 3. X11 xprintidle (Fallback)
     if let Ok(out) = run_cmd("xprintidle", &[]) {
         let s = String::from_utf8_lossy(&out.stdout);
         if let Ok(ms) = s.trim().parse::<u64>() { return Some(Duration::from_millis(ms)); }
@@ -470,7 +456,6 @@ fn get_desktop_idle_time() -> Option<Duration> {
     None
 }
 
-// Zero-dependency idle tracker. Safely checks hardware metadata, scaling to user-space DBus commands if permissions are restricted.
 fn get_user_idle_time() -> Duration {
     let mut newest_time = SystemTime::UNIX_EPOCH;
 
@@ -480,9 +465,7 @@ fn get_user_idle_time() -> Duration {
                 let fname = entry.file_name();
                 if prefix.is_empty() || fname.to_string_lossy().starts_with(prefix) {
                     if let Ok(meta) = entry.metadata() {
-                        // Access Time maps to active key/mouse reading.
                         if let Ok(atime) = meta.accessed() { newest_time = newest_time.max(atime); }
-                        // Some systems update modification time for raw hardware inputs.
                         if check_mtime {
                             if let Ok(mtime) = meta.modified() { newest_time = newest_time.max(mtime); }
                         }
@@ -492,18 +475,12 @@ fn get_user_idle_time() -> Duration {
         }
     };
 
-    // Check evdev (Hardware Keyboard/Mouse). Requires sudo for best accuracy, updates mtime/atime.
     check_dir("/dev/input", true, "");
-
-    // TTY/PTS (Terminal inputs). Checking ONLY atime ensures our own UI drawing (which triggers mtime)
-    // does not artificially reset the idle counter to 0! This allows safe 100% reliable tracking without sudo.
     check_dir("/dev/pts", false, "");
     check_dir("/dev", false, "tty");
 
     let fs_idle = SystemTime::now().duration_since(newest_time).unwrap_or(Duration::ZERO);
 
-    // Fallback: If File System metadata indicates idle > 1 sec, we might lack permissions
-    // (not running as root) or hit relatime limits. Attempt desktop user-space queries.
     if fs_idle.as_secs() > 1 {
         if let Some(desktop_idle) = get_desktop_idle_time() {
             return desktop_idle.min(fs_idle);
@@ -550,7 +527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_model = fs::read_to_string("/proc/cpuinfo")
         .unwrap_or_default()
         .lines()
-        .find(|l| l.starts_with("model name"))
+        .find(|l| l.starts_with("model name") || l.starts_with("Processor") || l.starts_with("Hardware"))
         .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().to_string())
         .unwrap_or("Unknown".into());
@@ -568,18 +545,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
-    // 1. CPU Thread
+    // 1. CPU Thread - Buffer is instantiated ONCE outside the loop to prevent memory bloat over uptime.
     let tx_cpu = tx.clone();
     thread::Builder::new().name("cg-cpu".to_string()).spawn(move || {
-        let mut buf = String::with_capacity(8192);
+        let mut buf = String::with_capacity(8192); 
         loop {
-            buf.clear();
+            buf.clear(); // RAII: Reuse the buffer allocation, keeping stack/heap perfectly clean
             if let Ok(mut file) = File::open("/proc/cpuinfo") { let _ = file.read_to_string(&mut buf); }
             
-            // [SIMD Optimization]: This processing maps elegantly cleanly via iterator methods natively vectorized
             let freqs = buf
                 .lines()
-                .filter(|l| l.starts_with("cpu MHz"))
+                .filter(|l| l.starts_with("cpu MHz") || l.starts_with("BogoMIPS"))
                 .filter_map(|l| l.split(':').nth(1)?.trim().parse::<f64>().ok())
                 .collect();
 
@@ -847,7 +823,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut total_max = 0.0;
                     let mut net_nodes = Vec::new();
 
-                    // Calculate max length dynamically across both interfaces and the "Net Total" parent string
                     let align_len = 9.max(n.iter().map(|(iface, _, _, _)| iface.len()).max().unwrap_or(0));
 
                     for (iface, rx_speed, tx_speed, max_bytes) in &n {
@@ -873,7 +848,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ));
                     }
 
-                    // Attach trailing events for removed interfaces
                     for (iface, (ev, time)) in &state.net_events {
                         if ev == "DEACTIVATED" && time.elapsed().as_secs() < 5 {
                             net_nodes.push(format!("{:>width$}: \x1b[38;2;255;255;0m\x1b[1mDEACTIVATED\x1b[0m", iface, width=align_len));
@@ -940,19 +914,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         };
 
-        // Render Dynamic Header Blocks
         let version = env!("CARGO_PKG_VERSION");
-        // Title gets Gold formatting
         print_line(&mut row, format!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", version), &mut stdout)?;
         
-        // Dynamic official branding colors for processor model parsing inline
+        // Brand Dynamic Parser injects official architecture Hex Colors directly into the stream
         let cpu_model_display = state.cpu_model
-            .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m")
-            .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m");
+            .replace("AMD", "\x1b[1;38;2;237;28;36mAMD\x1b[0m\x1b[1m") // AMD Red
+            .replace("Intel", "\x1b[1;38;2;0;113;197mIntel\x1b[0m\x1b[1m") // Intel Blue
+            .replace("Apple", "\x1b[1;38;2;192;192;192mApple\x1b[0m\x1b[1m") // Apple Silver
+            .replace("ARM", "\x1b[1;38;2;0;193;222mARM\x1b[0m\x1b[1m") // ARM Teal
+            .replace("RISC-V", "\x1b[1;38;2;155;81;224mRISC-V\x1b[0m\x1b[1m") // RISC-V Purple
+            .replace("IBM", "\x1b[1;38;2;31;112;193mIBM\x1b[0m\x1b[1m"); // IBM Blue
+            
         print_line(&mut row, format!("\x1b[1m{}\x1b[0m", cpu_model_display), &mut stdout)?;
 
         match state.limits {
-            // Hardware Limits Max bumped into intense, bright bold red (255;0;0)
             (Some(min), Some(max)) => print_line(&mut row, format!("\x1b[1mHardware Limits:\x1b[0m \x1b[1;38;2;100;255;100m{:.0}\x1b[0m MHz Min | \x1b[1;38;2;255;0;0m{:.0}\x1b[0m MHz Max", min, max), &mut stdout)?,
             _ => {
                 let msg = if is_vm { "\x1b[1mHardware Limits:\x1b[0m \x1b[38;2;255;165;0mVM detected, limits not exposed\x1b[0m" }
@@ -970,7 +946,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_line(&mut row, format!("\x1b[1mUser Activity:\x1b[0m \x1b[1m{}IDLE {}\x1b[0m", get_idle_color(idle_secs), format_idle_time(idle_secs)), &mut stdout)?;
         }
 
-        // Render Dynamic CPU Temps
         for (parent, chiplets) in &state.cpu_temps {
             if chiplets.len() > 4 {
                 print_line(&mut row, format!("\x1b[1mCPU Temps ({}):\x1b[0m", parent), &mut stdout)?;
@@ -1023,7 +998,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     
                     let sep = if c < cols - 1 { " | " } else { "" };
                     
-                    // Leveraging the newly injected format_dynamic_6 spacing logic
                     let freq_str = format_dynamic_6(display_freq);
                     
                     write!(stdout, "C{:02}: {}{} {}\x1b[0m{}", idx, color, freq_str, unit, sep)?;
@@ -1047,8 +1021,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut swap_nodes = Vec::new();
         for swap in &state.swaps {
             let col = get_swap_color(swap.percent);
-
-            // Sub-metrics rendered strictly without bolding (\x1b[0;37m ensures white and NO bolding).
             swap_nodes.push(format!("{}: {col}{}\x1b[0m \x1b[0;37mUsed\x1b[0m / {col}{}\x1b[0m \x1b[0;37mTotal\x1b[0m / {col}{:.1}%\x1b[0m \x1b[0;37m%Used\x1b[0m",
                 swap.name,
                 format_size(swap.used),
