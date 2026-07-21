@@ -141,7 +141,6 @@ fn print_help() {
     println!("\nColor Legend (Color shade gradually changes between the ranges defined underneath):");
     println!("  CPU Freq:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-100%) -> {vio}Violet{rst}(>100% overclock)");
     println!("  RAM Load:       {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-85%) -> {red}Hot Red{rst}(85-95%) -> {vio}Violet{rst}(>=95%)");
-    println!("                  (Used and Available values share the same color to indicate total memory pressure)");
     println!("  Swap Load:      {grn}Green{rst}(0-50%) -> {yel}Yellow{rst}(50-70%) -> {org}Orange{rst}(70-80%) -> {red}Hot Red{rst}(80-90%) -> {vio}Violet{rst}(>=90%)");
     println!("  Network Load:   {grn}Green{rst}(Low) -> {yel}Yellow{rst} -> {org}Orange{rst} -> {red}Hot Red{rst}(Near Interface Max) -> {vio}Violet{rst}(Exceeds Theoretical)");
     println!("  Storage Space:  {grn}Green{rst}(0-75%) -> {yel}Yellow{rst}(75-85%) -> {org}Orange{rst}(85-90%) -> {red}Hot Red{rst}(90-95%) -> {vio}Violet{rst}(>=95%)");
@@ -411,7 +410,7 @@ fn get_thermal_stats(is_vm: bool) -> Vec<(String, Vec<TempStat>)> {
             if !name.trim().contains("k10temp") && !name.trim().contains("coretemp") { continue; }
 
             let parent_name = name.trim().to_string();
-            let mut chiplet_parts = Vec::new();
+            let mut chiplet_parts = Vec::with_capacity(16);
 
             for file in fs::read_dir(&path).into_iter().flatten().flatten() {
                 let fname = file.file_name().to_string_lossy().into_owned();
@@ -546,7 +545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match arg.as_str() {
             "-h" | "--help" => { print_help(); std::process::exit(0); }
             "-v" | "--version" => {
-                println!("CPU-Grid ver:{}", env!("CARGO_PKG_VERSION"));
+                println!("\x1b[1;38;2;255;215;0mCPU-Grid ver:{}\x1b[0m", env!("CARGO_PKG_VERSION"));
                 println!("Copyright (C) 2026 StatusCode404 https://github.com/StatusCode404");
                 std::process::exit(0);
             }
@@ -613,26 +612,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Room Temp Thread
     let tx_room = tx.clone();
-    thread::Builder::new().name("cg-room".to_string()).spawn(move || loop {
+    thread::Builder::new().name("cg-room".to_string()).spawn(move || {
+        // Hoisted discovery: Resolves driver location path ONLY ONCE rather than polling `which` recursively on loop
         let cmd_path = find_temper_poll().unwrap_or_else(|| std::path::PathBuf::from("temper-poll"));
-        let out = Command::new(&cmd_path).output();
-        let msg = if let Ok(o) = out {
-            let s = String::from_utf8_lossy(&o.stdout);
-            if let Some(line) = s.lines().find(|l| l.contains("Device #0:")) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if let Some(temp_str) = parts.iter().find(|p| p.contains('°')) {
-                    let clean_temp = temp_str.replace('°', "").replace('C', "");
-                    if let Ok(temp) = clean_temp.parse::<f64>() {
-                        let mut final_temp = format!("{}\x1b[1m{:.1}°C\x1b[0m", get_room_temp_color(temp), temp);
-                        if temp >= 40.0 { final_temp.push_str(" \x1b[1;38;2;255;165;0mWARNING:\x1b[0m \x1b[1;38;2;238;130;238mAmbient Temp is too HOT! Consider Shutting Down!\x1b[0m"); }
-                        final_temp
+        loop {
+            let out = Command::new(&cmd_path).output();
+            let msg = if let Ok(o) = out {
+                let s = String::from_utf8_lossy(&o.stdout);
+                if let Some(line) = s.lines().find(|l| l.contains("Device #0:")) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(temp_str) = parts.iter().find(|p| p.contains('°')) {
+                        let clean_temp = temp_str.replace('°', "").replace('C', "");
+                        if let Ok(temp) = clean_temp.parse::<f64>() {
+                            let mut final_temp = format!("{}\x1b[1m{:.1}°C\x1b[0m", get_room_temp_color(temp), temp);
+                            if temp >= 40.0 { final_temp.push_str(" \x1b[1;38;2;255;165;0mWARNING:\x1b[0m \x1b[1;38;2;238;130;238mAmbient Temp is too HOT! Consider Shutting Down!\x1b[0m"); }
+                            final_temp
+                        } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
                     } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
                 } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
-            } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() }
-        } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() };
+            } else { "\x1b[38;2;255;0;0mNo thermometer detected\x1b[0m".to_string() };
 
-        if tx_room.send(Msg::RoomTemp(msg)).is_err() { break; }
-        thread::sleep(Duration::from_secs_f64(room_interval));
+            if tx_room.send(Msg::RoomTemp(msg)).is_err() { break; }
+            thread::sleep(Duration::from_secs_f64(room_interval));
+        }
     }).unwrap();
 
     // 4. Memory Thread
@@ -895,7 +897,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let max_mount_len = sorted_mounts.iter().map(|t| t.2.chars().count()).max().unwrap_or(4);
 
-            // Explicit dereferencing of tuple values perfectly neutralizes match ergonomics pointer buildup (`E0614`)
             for tuple in &sorted_mounts {
                 let total_bytes: u64 = (*tuple).0;
                 let used_bytes: u64 = (*tuple).1;
@@ -1017,6 +1018,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         idle_time: Duration::ZERO,
     };
 
+    // Pre-allocated UI Render Buffer array to prevent heap fragmentations when rendering Dynamic Layout 2-col grids.
+    let mut combined_disk_nodes = Vec::with_capacity(16);
+
     loop {
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
@@ -1039,7 +1043,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut total_rx = 0.0;
                     let mut total_tx = 0.0;
                     let mut total_max = 0.0;
-                    let mut net_nodes = Vec::with_capacity(n.len() + state.net_events.len());
+                    state.net_stats.clear();
+                   
                     let align_len = 9.max(n.iter().map(|(iface, _, _, _)| iface.len()).max().unwrap_or(0));
 
                     for (iface, rx_speed, tx_speed, max_bytes) in &n {
@@ -1050,7 +1055,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some((ev, time)) = state.net_events.get(iface) {
                             if time.elapsed().as_secs() < 5 {
                                 let ev_color = if ev == "ACTIVATED" { "\x1b[38;2;0;200;0m" } else { "\x1b[38;2;255;255;0m" };
-                                net_nodes.push(format!("{:>width$}: \x1b[1m{}{}{}\x1b[0m", iface, ev_color, ev, "\x1b[0m", width=align_len));
+                                state.net_stats.push(format!("{:>width$}: \x1b[1m{}{}{}\x1b[0m", iface, ev_color, ev, "\x1b[0m", width=align_len));
                                 continue;
                             }
                         }
@@ -1060,13 +1065,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let rx_str = format_net_speed(*rx_speed);
                         let tx_str = format_net_speed(*tx_speed);
                        
-                        net_nodes.push(format!("{:>width$}: {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
+                        state.net_stats.push(format!("{:>width$}: {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
                             iface, rx_col, rx_str, tx_col, tx_str, width=align_len));
                     }
 
                     for (iface, (ev, time)) in &state.net_events {
                         if ev == "DEACTIVATED" && time.elapsed().as_secs() < 5 {
-                            net_nodes.push(format!("{:>width$}: \x1b[38;2;255;255;0m\x1b[1mDEACTIVATED\x1b[0m", iface, width=align_len));
+                            state.net_stats.push(format!("{:>width$}: \x1b[38;2;255;255;0m\x1b[1mDEACTIVATED\x1b[0m", iface, width=align_len));
                         }
                     }
 
@@ -1075,7 +1080,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     state.net_total_str = format!("\x1b[1m{:>width$}:\x1b[0m {}\x1b[1m{}\x1b[0m \x1b[1;37m↓\x1b[0m  {}\x1b[1m{}\x1b[0m \x1b[1;37m↑\x1b[0m",
                         "Net Total", total_rx_col, format_net_speed(total_rx), total_tx_col, format_net_speed(total_tx), width=align_len);
-                    state.net_stats = net_nodes;
                 },
                 Msg::DiskStats { disk_cap_parent, disk_io_parent, disk_combined_parent, disk_cap_nodes, disk_io_nodes } => {
                     state.disk_cap_parent = disk_cap_parent;
@@ -1272,14 +1276,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 row += 1;
             }
             print_line(&mut row, &state.disk_combined_parent, &mut stdout)?;
-            let mut combined = Vec::with_capacity(state.disk_cap_nodes.len());
+            combined_disk_nodes.clear();
             for i in 0..state.disk_cap_nodes.len() {
                 let cap = &state.disk_cap_nodes[i];
                 let io = &state.disk_io_nodes[i];
                 let pad = " ".repeat(max_cap_len.saturating_sub(strip_ansi(cap)));
-                combined.push(format!("{}{} | {}", cap, pad, io));
+                combined_disk_nodes.push(format!("{}{} | {}", cap, pad, io));
             }
-            print_aligned_2col_grid(&mut row, &combined, max_w as usize, &mut stdout)?;
+            print_aligned_2col_grid(&mut row, &combined_disk_nodes, max_w as usize, &mut stdout)?;
         } else {
             if row < max_h {
                 stdout.queue(cursor::MoveTo(0, row))?;
