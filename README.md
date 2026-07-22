@@ -67,5 +67,24 @@ Values are in seconds. Boundaries are strictly enforced.
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/StatusCode404/CPU-Grid.git](https://github.com/StatusCode404/CPU-Grid.git)
+   git clone https://github.com/StatusCode404/CPU-Grid.git
    cd cpu-grid
+   cargo build --release
+2. To run without Zswap monitoring...
+   ```bash
+   ./target/release/cpu_grid
+3. To run with Zswap monitoring requires sudo privileges...
+   ```bash
+   sudo ./target/release/cpu_grid
+4. If you have optional Temper USB thermometers for room temperature and you have temper-py (https://pypi.org/project/temper-py/) drivers.
+    - temper-py installed only for $USER and not system-wide
+      ```bash
+      ./target/release/cpu_grid
+    - temper-py installed only for $USER and not system-wide but with Zswap monitoring
+      ```bash
+      sudo -E ./target/release/cpu_grid
+    - temper-py installed system-wide and with Zswap monitoring
+      ```bash
+      sudo ./target/release/cpu_grid
+
+   
